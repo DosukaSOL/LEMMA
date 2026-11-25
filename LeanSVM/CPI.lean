@@ -207,4 +207,81 @@ namespace LeanSVM.CPI
   let rc ← sysInvokeSignedC buf infos 2 0 0
   SolanaM.require (rc == 0) rc
 
+/-- Shared helper: write a 3-seed PDA `SolSignerSeedsC` (`[tag(4B), keySeed(32B), bump(1B)]`)
+    into a 72-byte buffer `sbuf` (`seedBuf:8 + seedsArr:48 + signersArr:16`) and return `signersArr`. -/
+@[inline] private def writePdaSigner3 (sbuf : Ptr) (tagU32 : UInt32) (keySeedPtr : Ptr) (bump : UInt8) :
+    SolanaM Ptr := do
+  let seedsArr   := sbuf + 8
+  let signersArr := sbuf + 56
+  storeU32 sbuf 0 tagU32
+  storeU8  sbuf 4 bump
+  storeU64 seedsArr 0  sbuf
+  storeU64 seedsArr 8  4
+  storeU64 seedsArr 16 keySeedPtr
+  storeU64 seedsArr 24 32
+  storeU64 seedsArr 32 (sbuf + 4)
+  storeU64 seedsArr 40 1
+  storeU64 signersArr 0 seedsArr
+  storeU64 signersArr 8 3
+  return signersArr
+
+/-- Invoke Solana `SystemProgram::Allocate` (opcode 8u32) with a 3-seed PDA signer
+    `[tag(4B), keySeed(32B), bump(1B)]` to allocate `space` bytes for `pdaAcc`.
+    Combined with `systemAssignSigned` + `systemTransfer`, this creates PDA accounts on-chain
+    while remaining 100% immune to pre-funding lamport griefing! -/
+@[noinline] def systemAllocateSigned (sysProg pdaAcc : AccountView) (space : UInt64)
+    (tagU32 : UInt32) (keySeedPtr : Ptr) (bump : UInt8) : SolanaM Unit := do
+  -- 40B ix + 16B meta + 56B info + 16B data + 72B seeds = 200 bytes
+  let buf ← stackAlloc 200
+  let metas := buf + 40
+  let infos := buf + 56
+  let data  := buf + 112
+  let sbuf  := buf + 128
+  storeU32 data 0 8
+  storeU64 data 4 space
+  writeMeta metas pdaAcc 1 1
+  writeAccountInfo infos pdaAcc
+  writeInstruction buf (AccountView.keyPtr sysProg) metas 1 data 12
+  let signersArr ← writePdaSigner3 sbuf tagU32 keySeedPtr bump
+  let rc ← sysInvokeSignedC buf infos 1 signersArr 1
+  SolanaM.require (rc == 0) rc
+
+/-- Invoke Solana `SystemProgram::Assign` (opcode 1u32) with a 3-seed PDA signer
+    `[tag(4B), keySeed(32B), bump(1B)]` to assign ownership of `pdaAcc` to `newOwnerKeyPtr`. -/
+@[noinline] def systemAssignSigned (sysProg pdaAcc : AccountView) (newOwnerKeyPtr : Ptr)
+    (tagU32 : UInt32) (keySeedPtr : Ptr) (bump : UInt8) : SolanaM Unit := do
+  -- 40B ix + 16B meta + 56B info + 40B data + 72B seeds = 224 bytes
+  let buf ← stackAlloc 224
+  let metas := buf + 40
+  let infos := buf + 56
+  let data  := buf + 112
+  let sbuf  := buf + 152
+  storeU32 data 0 1
+  pubkeyCopy (data + 4) newOwnerKeyPtr
+  writeMeta metas pdaAcc 1 1
+  writeAccountInfo infos pdaAcc
+  writeInstruction buf (AccountView.keyPtr sysProg) metas 1 data 36
+  let signersArr ← writePdaSigner3 sbuf tagU32 keySeedPtr bump
+  let rc ← sysInvokeSignedC buf infos 1 signersArr 1
+  SolanaM.require (rc == 0) rc
+
+/-- Invoke SPL Token OR SPL Token-2022 `InitializeAccount3` (opcode 18u8) to initialize
+    token account `account` for `mint` with owner `ownerKeyPtr` (no Rent sysvar needed!). -/
+@[noinline] def tokenInitializeAccount3 (tokenProg account mint : AccountView) (ownerKeyPtr : Ptr) :
+    SolanaM Unit := do
+  -- 40B ix + 32B metas + 112B infos + 40B data = 224 bytes
+  let buf ← stackAlloc 224
+  let metas := buf + 40
+  let infos := buf + 72
+  let data  := buf + 184
+  storeU8 data 0 18
+  pubkeyCopy (data + 1) ownerKeyPtr
+  writeMeta metas        account 1 0
+  writeMeta (metas + 16) mint    0 0
+  writeAccountInfo infos        account
+  writeAccountInfo (infos + 56) mint
+  writeInstruction buf (AccountView.keyPtr tokenProg) metas 2 data 33
+  let rc ← sysInvokeSignedC buf infos 2 0 0
+  SolanaM.require (rc == 0) rc
+
 end LeanSVM.CPI

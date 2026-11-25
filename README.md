@@ -90,7 +90,7 @@ Lean 4 Monomorphic LCNF (`Lean.Compiler.LCNF.monoExt`)
 - [`LeanSVM/Runtime.lean`](LeanSVM/Runtime.lean) — Pure functional `SvmState` verification model + `@[noinline]` hardware/syscall intrinsics + `bv_decide` memory read/write theorems
 - [`LeanSVM/Input.lean`](LeanSVM/Input.lean) — Demand-driven zero-copy account cursor, inline/auto-outlined 32-byte `pubkeyEq`/`pubkeyCopy`, checked arithmetic
 - [`LeanSVM/Math.lean`](LeanSVM/Math.lean) — Overflow-safe 128-bit `mulDiv64` / `mulDiv64Ceil` (fast 64-bit path + shared 128-bit fallback) & Newton `isqrt64`
-- [`LeanSVM/CPI.lean`](LeanSVM/CPI.lean) — Zero-heap stack-allocated `sol_invoke_signed_c` CPIs for **SPL Token**, **SPL Token-2022** (`TransferChecked`, `MintTo`, `Burn`), PDA signing, and `SystemProgram::Transfer`
+- [`LeanSVM/CPI.lean`](LeanSVM/CPI.lean) — Zero-heap stack-allocated `sol_invoke_signed_c` CPIs for **SPL Token**, **SPL Token-2022** (`TransferChecked`, `MintTo`, `Burn`, `InitializeAccount3`), PDA signing, and `SystemProgram` (`Transfer`, PDA-signed `Allocate`, PDA-signed `Assign`)
 - [`LeanSVM/SBPF/`](LeanSVM/SBPF/) — Native sBPF v0/v3 ISA encoder, Murmur3-32 hasher, disassembler, peephole & value-tracking optimizer, and ELF64 `.so` linker
 - [`LeanSVM/Compiler/`](LeanSVM/Compiler/) — `IR`, `Lower`, `Optimize`, `RegAlloc`, `CodeGen`, `Driver`
 - [`Examples/`](Examples/) — 8 formally verified Solana programs (`Noop`, `Counter`, `Vault`, `HashCheck`, `Amm`, `Lending`, `DutchAuction`, `BondingCurve`)
