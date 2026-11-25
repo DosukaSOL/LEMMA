@@ -25,11 +25,11 @@ private def blkLabel (f : Func) (id : BlockId) : String :=
   else
     s!"{f.labelPrefix}bb{id}"
 
-private def getLoc (alloc : AllocResult) (v : VReg) : Loc :=
+def getLoc (alloc : AllocResult) (v : VReg) : Loc :=
   alloc.locs.getD v (.reg Reg.r0)
 
 /-- Emit a 64-bit constant into `dst` using the shortest sBPF encoding (`mov64`, `mov32`, or `lddw`). -/
-private def emitConst64 (dst : Reg) (val : UInt64) (out : Array Insn) : Array Insn :=
+def emitConst64 (dst : Reg) (val : UInt64) (out : Array Insn) : Array Insn :=
   match fitsInt32 val with
   | some i32 => out.push (.alu64Imm .mov dst i32)
   | none =>
@@ -38,7 +38,7 @@ private def emitConst64 (dst : Reg) (val : UInt64) (out : Array Insn) : Array In
     | none => out.push (.lddw dst val)
 
 /-- Load `v` into a physical register (no instruction if already in a register). -/
-private def loadVReg (alloc : AllocResult) (v : VReg) (scratch : Reg) (out : Array Insn) :
+def loadVReg (alloc : AllocResult) (v : VReg) (scratch : Reg) (out : Array Insn) :
     Reg × Array Insn :=
   match getLoc alloc v with
   | .reg r => (r, out)
@@ -46,16 +46,32 @@ private def loadVReg (alloc : AllocResult) (v : VReg) (scratch : Reg) (out : Arr
   | .imm val => (scratch, emitConst64 scratch val out)
 
 /-- Store result register `src` into `v`'s allocated location. -/
-private def storeVReg (alloc : AllocResult) (v : VReg) (src : Reg) (out : Array Insn) : Array Insn :=
+def storeVReg (alloc : AllocResult) (v : VReg) (src : Reg) (out : Array Insn) : Array Insn :=
   match getLoc alloc v with
   | .reg r => if r == src then out else out.push (.alu64Reg .mov r src)
   | .stack off => out.push (.stx .b8 Reg.r10 src off)
   | .imm _ => out
 
+/-- Emit one single `Loc := Loc` move instruction sequence using `memTmp` for stack-to-stack
+    and wide immediate-to-stack copies. -/
+def emitSingleLocMove (dst src : Loc) (memTmp : Reg) (out : Array Insn) : Array Insn :=
+  match dst, src with
+  | .reg dr, .reg sr     => out.push (.alu64Reg .mov dr sr)
+  | .reg dr, .stack soff => out.push (.ldx .b8 dr Reg.r10 soff)
+  | .reg dr, .imm val    => emitConst64 dr val out
+  | .stack doff, .reg sr => out.push (.stx .b8 Reg.r10 sr doff)
+  | .stack doff, .stack soff =>
+    out.push (.ldx .b8 memTmp Reg.r10 soff) |>.push (.stx .b8 Reg.r10 memTmp doff)
+  | .stack doff, .imm val =>
+    match fitsInt32 val with
+    | some i32 => out.push (.stImm .b8 Reg.r10 doff i32)
+    | none => emitConst64 memTmp val out |>.push (.stx .b8 Reg.r10 memTmp doff)
+  | .imm _, _ => out
+
 /-- Emit cycle-safe parallel register/stack moves: `dsts[i] := srcs[i]`.
     `cycleTmp` (`r0`) breaks pure cycles; `memTmp` (`r5`, reserved whenever spills occur)
     handles stack-to-stack copies so `cycleTmp` is NEVER clobbered! -/
-private def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (memTmp : Reg := Reg.r5)
+def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (memTmp : Reg := Reg.r5)
     (out : Array Insn) : Array Insn := Id.run do
   let mut pending := moves.filter (fun p => p.1 != p.2)
   let mut acc := out
@@ -73,18 +89,7 @@ private def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (
     | some idx =>
       let (dst, src) := pending[idx]!
       pending := pending.eraseIdx! idx
-      acc := match dst, src with
-        | .reg dr, .reg sr     => acc.push (.alu64Reg .mov dr sr)
-        | .reg dr, .stack soff => acc.push (.ldx .b8 dr Reg.r10 soff)
-        | .reg dr, .imm val    => emitConst64 dr val acc
-        | .stack doff, .reg sr => acc.push (.stx .b8 Reg.r10 sr doff)
-        | .stack doff, .stack soff =>
-          acc.push (.ldx .b8 memTmp Reg.r10 soff) |>.push (.stx .b8 Reg.r10 memTmp doff)
-        | .stack doff, .imm val =>
-          match fitsInt32 val with
-          | some i32 => acc.push (.stImm .b8 Reg.r10 doff i32)
-          | none => emitConst64 memTmp val acc |>.push (.stx .b8 Reg.r10 memTmp doff)
-        | .imm _, _ => acc
+      acc := emitSingleLocMove dst src memTmp acc
     | none =>
       let (dst, src) := pending[0]!
       pending := pending.eraseIdx! 0
@@ -93,18 +98,7 @@ private def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (
         | .stack doff => acc.push (.ldx .b8 cycleTmp Reg.r10 doff)
         | .imm _ => acc
       pending := pending.map (fun p => if p.2 == dst then (p.1, .reg cycleTmp) else p)
-      acc := match dst, src with
-        | .reg dr, .reg sr     => acc.push (.alu64Reg .mov dr sr)
-        | .reg dr, .stack soff => acc.push (.ldx .b8 dr Reg.r10 soff)
-        | .reg dr, .imm val    => emitConst64 dr val acc
-        | .stack doff, .reg sr => acc.push (.stx .b8 Reg.r10 sr doff)
-        | .stack doff, .stack soff =>
-          acc.push (.ldx .b8 memTmp Reg.r10 soff) |>.push (.stx .b8 Reg.r10 memTmp doff)
-        | .stack doff, .imm val =>
-          match fitsInt32 val with
-          | some i32 => acc.push (.stImm .b8 Reg.r10 doff i32)
-          | none => emitConst64 memTmp val acc |>.push (.stx .b8 Reg.r10 memTmp doff)
-        | .imm _, _ => acc
+      acc := emitSingleLocMove dst src memTmp acc
   return acc
 
 /-- Check whether an edge's block-parameter moves are all 0-instruction no-ops. -/
@@ -134,7 +128,7 @@ private def emitEdgeMoves (alloc : AllocResult) (blkMap : Std.HashMap BlockId Bl
       return emitParallelLocMoves moves Reg.r0 Reg.r5 out
 
 /-- Emit sBPF instructions for a single IR statement. -/
-private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter : Nat) (out : Array Insn) :
+def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter : Nat) (out : Array Insn) :
     Array Insn × Nat :=
   match stmt with
   | .constImm dst val =>
@@ -220,11 +214,24 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
       match getLoc alloc dst with
       | .reg dr => if dr != lr && dr != rr then dr else Reg.r0
       | .stack _ | .imm _ => Reg.r0
-    let o3 := o2
-      |>.push (.alu64Imm .mov targetReg 1)
-      |>.push (.jccReg op.toJmpCond lr rr doneLbl)
-      |>.push (.alu64Imm .mov targetReg 0)
-      |>.push (.label doneLbl)
+    let o3 :=
+      if targetReg != lr && targetReg != rr then
+        o2
+          |>.push (.alu64Imm .mov targetReg 1)
+          |>.push (.jccReg op.toJmpCond lr rr doneLbl)
+          |>.push (.alu64Imm .mov targetReg 0)
+          |>.push (.label doneLbl)
+      else
+        -- `targetReg` aliases `lr` or `rr` (e.g. spilled `lhs` & `dst` both use `r0`):
+        -- evaluate branch BEFORE writing `targetReg` so neither operand is clobbered!
+        let trueLbl := s!"{f.labelPrefix}_cmpt_{cmpCounter}"
+        o2
+          |>.push (.jccReg op.toJmpCond lr rr trueLbl)
+          |>.push (.alu64Imm .mov targetReg 0)
+          |>.push (.ja doneLbl)
+          |>.push (.label trueLbl)
+          |>.push (.alu64Imm .mov targetReg 1)
+          |>.push (.label doneLbl)
     (storeVReg alloc dst targetReg o3, cmpCounter + 1)
   | .load sz dst base off =>
     match getLoc alloc dst with

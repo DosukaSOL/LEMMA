@@ -1396,28 +1396,30 @@ where
       let (_, alt1) := explicit[1]!
       let savedStack := (← get).stackAllocBytes
       let savedRetSlot := (← get).callRetSlotOff?
+      let savedArgsPack := (← get).callArgsPack?
       let blk0 ← newBlock
       let blk1 ← newBlock
       setTerm (.brCmpImm .eq tagReg (Int32.ofInt tag0) blk0 #[] blk1 #[])
       switchBlock blk0
       lowerOne alt0
       let stack0 := (← get).stackAllocBytes
-      modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
+      modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot, callArgsPack? := savedArgsPack }
       switchBlock blk1
       lowerOne alt1
       let stack1 := (← get).stackAllocBytes
-      modify fun st => { st with stackAllocBytes := max stack0 stack1, callRetSlotOff? := savedRetSlot }
+      modify fun st => { st with stackAllocBytes := max stack0 stack1, callRetSlotOff? := savedRetSlot, callArgsPack? := savedArgsPack }
     else
       -- Multi-way switch chain with scoped stack reuse across mutually exclusive arms!
       let savedStack := (← get).stackAllocBytes
       let savedRetSlot := (← get).callRetSlotOff?
+      let savedArgsPack := (← get).callArgsPack?
       let mut maxStack := savedStack
       let mut curIdx := 0
       while curIdx < explicit.size do
         let (tagI, altI) := explicit[curIdx]!
         let isLast := curIdx + 1 == explicit.size && default?.isNone
         if isLast then
-          modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
+          modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot, callArgsPack? := savedArgsPack }
           lowerOne altI
           maxStack := max maxStack (← get).stackAllocBytes
         else
@@ -1425,16 +1427,16 @@ where
           let nextBlk ← newBlock
           setTerm (.brCmpImm .eq tagReg (Int32.ofInt tagI) hitBlk #[] nextBlk #[])
           switchBlock hitBlk
-          modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
+          modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot, callArgsPack? := savedArgsPack }
           lowerOne altI
           maxStack := max maxStack (← get).stackAllocBytes
           switchBlock nextBlk
         curIdx := curIdx + 1
       if let some d := default? then
-        modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
+        modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot, callArgsPack? := savedArgsPack }
         lowerOne d
         maxStack := max maxStack (← get).stackAllocBytes
-      modify fun st => { st with stackAllocBytes := maxStack, callRetSlotOff? := savedRetSlot }
+      modify fun st => { st with stackAllocBytes := maxStack, callRetSlotOff? := savedRetSlot, callArgsPack? := savedArgsPack }
 
 /-- Lower a top-level Lean 4 Solana entrypoint declaration (`input : Ptr → SolanaM Unit` or `Ptr → UInt64`)
     from its monomorphic LCNF into an unoptimized `SbfIR.Program`. -/

@@ -26,10 +26,10 @@ def fitsUInt32 (v : UInt64) : Option Int32 :=
   else
     none
 
-/-- Shrink a single instruction (e.g. `lddw` -> `mov64`/`mov32`, `mul 2^k` -> `lsh k`). -/
+/-- Shrink a single instruction (e.g. `lddw` -> `mov64`/`mov32`, `mul 2^k` -> `lsh k`).
+    Note: `alu32Reg .mov d d` is NOT dropped because 32-bit `mov` zero-extends the lower 32 bits! -/
 def shrinkInsn : Insn → Option Insn
   | .alu64Reg .mov d s => if d == s then none else some (.alu64Reg .mov d s)
-  | .alu32Reg .mov d s => if d == s then none else some (.alu32Reg .mov d s)
   | .alu64Imm .add _ 0 => none
   | .alu64Imm .sub _ 0 => none
   | .alu64Imm .or  _ 0 => none
@@ -194,9 +194,10 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
             changed := true
             i := i + 1
             continue
-        -- Store-to-reload forwarding: `stx [base+off], rA; ldx rA, [base+off]` -> drop reload!
-        | .stx sz1 b1 s1 off1, .ldx sz2 d2 b2 off2 =>
-          if sz1 == sz2 && b1 == b2 && off1 == off2 then
+        -- Store-to-reload forwarding (64-bit exact only; narrower widths zero-extend on load!):
+        -- `stxdw [base+off], rA; ldxdw rB, [base+off]` -> drop reload / `mov64 rB, rA`!
+        | .stx .b8 b1 s1 off1, .ldx .b8 d2 b2 off2 =>
+          if b1 == b2 && off1 == off2 then
             if d2 == s1 then
               out := out.push shrunk
               changed := true
@@ -255,8 +256,12 @@ private def bbValueTrackPass (insns : Array Insn) : Array Insn × Bool := Id.run
   let mut regStack : Array (Option Int16)  := Array.replicate 11 none
 
   let resetAll := (Array.replicate 11 (none : Option UInt64), Array.replicate 11 (none : Option Int16))
-  let clearSlot (rs : Array (Option Int16)) (off : Int16) : Array (Option Int16) :=
-    rs.map (fun o => if o == some off then none else o)
+  -- Clear every tracked 8-byte stack slot whose `[o, o+8)` byte range overlaps `[off, off+8)`.
+  let clearOverlapping (rs : Array (Option Int16)) (off : Int16) : Array (Option Int16) :=
+    rs.map (fun o =>
+      match o with
+      | some o' => if Int.natAbs (o'.toInt - off.toInt) < 8 then none else some o'
+      | none => none)
   let immVal32 (i : Int32) : UInt64 := Int64.toUInt64 (Int64.ofInt i.toInt)
   let uimmVal32 (i : Int32) : UInt64 := (Int32.toUInt32 i).toUInt64
 
@@ -327,7 +332,7 @@ private def bbValueTrackPass (insns : Array Insn) : Array Insn × Bool := Id.run
         changed := true
       else
         if base == Reg.r10 then
-          regStack := clearSlot regStack off
+          regStack := clearOverlapping regStack off
           regStack := regStack.set! si (some off)
         else
           -- Indirect store could alias a stack buffer pointer (e.g. outBuf)

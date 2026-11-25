@@ -429,6 +429,25 @@ private def collectRematConsts (f : Func) : Std.HashMap VReg UInt64 := Id.run do
       remat := remat.insert v val
   return remat
 
+/-- Check whether `CodeGen` will ever use `Reg.r5` as a scratch register for `f` under `locs`
+    (any non-register operand in a second-operand `loadVReg _ _ r5` position). -/
+def funcUsesScratchR5 (f : Func) (locs : Std.HashMap VReg Loc) : Bool :=
+  let isNonReg (v : VReg) : Bool :=
+    match locs.get? v with
+    | some (.reg _) => false
+    | some (.stack _) | some (.imm _) => true
+    | none => false
+  f.blocks.any fun blk =>
+    (blk.stmts.any fun s =>
+      match s with
+      | .binOp _ _ _ r => isNonReg r
+      | .cmp _ _ _ r => isNonReg r
+      | .store _ _ _ v => isNonReg v
+      | _ => false) ||
+    match blk.term with
+    | .brCmp _ _ r _ _ _ _ => isNonReg r
+    | _ => false
+
 /-- Allocate physical sBPF registers (and minimal stack spill slots only if required) for `f`. -/
 def allocateRegisters (f : Func) : AllocResult :=
   let ordered := orderBlocksRPO f
@@ -441,8 +460,9 @@ def allocateRegisters (f : Func) : AllocResult :=
   let callee := #[SBPF.Reg.r6, SBPF.Reg.r7, SBPF.Reg.r8, SBPF.Reg.r9]
   let callerFull := #[SBPF.Reg.r1, SBPF.Reg.r2, SBPF.Reg.r3, SBPF.Reg.r4, SBPF.Reg.r5]
   let (locs1, stack1, spills1) := runLinearScan intervals callerFull callee f.stackAllocBytes
-  if spills1 == 0 then
-    { locs := addImmLocs locs1, orderedBlocks := ordered, totalStackBytes := stack1, spillCount := 0, usesScratch := false }
+  let locs1Full := addImmLocs locs1
+  if spills1 == 0 && !funcUsesScratchR5 f locs1Full then
+    { locs := locs1Full, orderedBlocks := ordered, totalStackBytes := stack1, spillCount := 0, usesScratch := false }
   else
     let callerSpill := #[SBPF.Reg.r1, SBPF.Reg.r2, SBPF.Reg.r3, SBPF.Reg.r4]
     let (locs2, stack2, spills2) := runLinearScan intervals callerSpill callee f.stackAllocBytes

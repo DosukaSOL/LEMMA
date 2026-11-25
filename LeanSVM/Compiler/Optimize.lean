@@ -19,7 +19,7 @@ import Std.Data.HashSet
 
 namespace LeanSVM.Compiler
 
-private def log2IfPow2 (v : UInt64) : Option Nat :=
+def log2IfPow2 (v : UInt64) : Option Nat :=
   if v == 0 || (v &&& (v - 1)) != 0 then none
   else
     let rec go (x : UInt64) (k : Nat) (fuel : Nat) : Nat :=
@@ -204,8 +204,8 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
               match log2IfPow2 cr with
               | some k => changed := true; s1 := .binImm .rsh64 d l (Int32.ofInt k)
               | none =>
-                if let some i32 := fitsInt32U64 cr then
-                  changed := true; s1 := .binImm .div64 d l i32
+                if cr > 0 && cr <= 0x7FFFFFFF then
+                  changed := true; s1 := .binImm .div64 d l (Int32.ofInt cr.toNat)
           | .mod64 =>
             if cr == 1 then
               changed := true; consts := consts.insert d 0; s1 := .constImm d 0
@@ -215,8 +215,8 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
                 if let some mask32 := fitsInt32U64 (cr - 1) then
                   changed := true; s1 := .binImm .and64 d l mask32
               | none =>
-                if let some i32 := fitsInt32U64 cr then
-                  changed := true; s1 := .binImm .mod64 d l i32
+                if cr > 0 && cr <= 0x7FFFFFFF then
+                  changed := true; s1 := .binImm .mod64 d l (Int32.ofInt cr.toNat)
           | .or64 =>
             if cr == 0 then changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else if let some i32 := fitsInt32U64 cr then changed := true; s1 := .binImm .or64 d l i32
@@ -230,6 +230,9 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
           | .lsh64 | .rsh64 | .arsh64 =>
             if (cr &&& 63) == 0 then changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else changed := true; s1 := .binImm op d l (Int32.ofInt (cr &&& 63).toNat)
+          | .div32 | .mod32 =>
+            if cr > 0 && cr <= 0x7FFFFFFF then
+              changed := true; s1 := .binImm op d l (Int32.ofInt cr.toNat)
           | _ =>
             if let some i32 := fitsInt32U64 cr then changed := true; s1 := .binImm op d l i32
         | some _, none =>
@@ -354,21 +357,17 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
         else if let some i32 := valImm? then
           changed := true
           s1 := .storeImm sz base off i32
-        -- Update load-CSE / store-to-load forwarding tables safely
+        -- Update load-CSE / store-to-load forwarding tables safely:
+        -- ANY store invalidates BOTH `localLoads` and `localStackLoads` (prevents stackAddr aliasing),
+        -- and only 64-bit (`.b8`) stores forward directly (narrower widths zero-extend on load!).
+        localLoads := {}
+        localStackLoads := {}
         match s1 with
-        | .store ssz sbase soff sval =>
-          localLoads := {}
-          localLoads := localLoads.insert (sbase, soff.toInt, memSizeTag ssz) sval
-        | .storeImm _ _ _ _ =>
-          localLoads := {}
-        | .storeStack ssz soff sval =>
-          localStackLoads := {}
-          localStackLoads := localStackLoads.insert (soff.toInt, memSizeTag ssz) sval
-        | .storeStackImm _ _ _ =>
-          localStackLoads := {}
-        | _ =>
-          localLoads := {}
-          localStackLoads := {}
+        | .store .b8 sbase soff sval =>
+          localLoads := localLoads.insert (sbase, soff.toInt, memSizeTag .b8) sval
+        | .storeStack .b8 soff sval =>
+          localStackLoads := localStackLoads.insert (soff.toInt, memSizeTag .b8) sval
+        | _ => pure ()
       | .storeImm sz base off imm =>
         if let some so := stackOffs.get? base then
           if let some combined := fitsInt16 (so + off.toInt) then
@@ -378,20 +377,21 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
           if let some combined := fitsInt16 (k + off.toInt) then
             changed := true
             s1 := .storeImm sz base0 combined imm
-        match s1 with
-        | .storeStackImm _ _ _ => localStackLoads := {}
-        | _ => localLoads := {}
+        localLoads := {}
+        localStackLoads := {}
       | .storeStack sz off val =>
         if let some cv := consts.get? val then
           if let some i32 := fitsInt32U64 cv then
             changed := true
             s1 := .storeStackImm sz off i32
+        localLoads := {}
         localStackLoads := {}
         match s1 with
-        | .storeStack ssz soff sval =>
-          localStackLoads := localStackLoads.insert (soff.toInt, memSizeTag ssz) sval
+        | .storeStack .b8 soff sval =>
+          localStackLoads := localStackLoads.insert (soff.toInt, memSizeTag .b8) sval
         | _ => pure ()
       | .storeStackImm _ _ _ =>
+        localLoads := {}
         localStackLoads := {}
       | .call _ _ _ | .syscall _ _ _ =>
         localLoads := {}
