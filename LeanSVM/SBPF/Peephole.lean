@@ -50,10 +50,22 @@ def shrinkInsn : Insn → Option Insn
       | none => some (.lddw d imm)
   | insn => some insn
 
+/-- Check whether `insn` unconditionally overwrites `r` without reading `r` first. -/
+def overwritesRegWithoutReading (r : Reg) : Insn → Bool
+  | .alu64Imm .mov d _ => d == r
+  | .alu32Imm .mov d _ => d == r
+  | .lddw d _ => d == r
+  | .lddwRodata d _ => d == r
+  | .alu64Reg .mov d s => d == r && s != r
+  | .ldx _ d base _ => d == r && base != r
+  | _ => false
+
 /-- Single pass of peephole optimizations on a symbolic sBPF instruction stream. -/
 private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
   -- Pre-scan labels that immediately point to `.exit` (for jump-to-exit forwarding!)
+  -- and labels whose body is `mov64 r0, rK; exit` (for zero-overhead fallible call checks!).
   let mut exitLabels : List String := []
+  let mut movExitLabels : List (String × Reg) := []
   let n := insns.size
   for k in [0:n] do
     match insns[k]! with
@@ -61,13 +73,24 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
       if k + 1 < n then
         match insns[k + 1]! with
         | .exit => if !exitLabels.contains lbl then exitLabels := lbl :: exitLabels
+        | .alu64Reg .mov d s =>
+          if d == Reg.r0 && s != Reg.r0 && k + 2 < n then
+            match insns[k + 2]! with
+            | .exit =>
+              if !(movExitLabels.any (fun p => p.1 == lbl)) then
+                movExitLabels := (lbl, s) :: movExitLabels
+            | _ => pure ()
         | _ => pure ()
     | _ => pure ()
+
+  let lookupMovExit (lbl : String) : Option Reg :=
+    (movExitLabels.find? (fun p => p.1 == lbl)).map Prod.snd
 
   let mut out : Array Insn := Array.emptyWithCapacity n
   let mut changed := false
   let mut i := 0
   let mut dead := false
+  let mut needR0ExitLabels : List String := []
   while i < n do
     let cur := insns[i]!
     -- Drop unreachable instructions after `exit` or `ja` until next label
@@ -91,11 +114,24 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
       continue
     | some shrunk =>
       if shrunk != cur then changed := true
-      -- Three-instruction window peepholes (e.g. `mov/lddw rX, c; mov r0, rX; exit` -> `mov/lddw r0, c; exit`)
+      -- Three-instruction window peepholes
       if i + 2 < n then
         let nxt := insns[i + 1]!
         let nxt2 := insns[i + 2]!
         match shrunk, nxt, nxt2 with
+        -- Zero-overhead fallible call check:
+        -- `mov64 rK, r0; jne rK, 0, L; <overwrites rK>` (where `L: mov64 r0, rK; exit`)
+        -- -> `jne r0, 0, L__r0; <overwrites rK>` (eliminates hot-path `mov64 r1, r0`!)
+        | .alu64Reg .mov k r0, .jccImm .ne k2 0 tgt, _ =>
+          if r0 == Reg.r0 && k == k2 && k != Reg.r0 && overwritesRegWithoutReading k nxt2 then
+            if lookupMovExit tgt == some k then
+              let r0Lbl := tgt ++ "__r0"
+              if !needR0ExitLabels.contains tgt then
+                needR0ExitLabels := tgt :: needR0ExitLabels
+              out := out.push (.jccImm .ne Reg.r0 0 r0Lbl)
+              changed := true
+              i := i + 2
+              continue
         | .alu64Imm .mov x imm, .alu64Reg .mov d x2, .exit =>
           if d == Reg.r0 && x == x2 then
             out := out.push (.alu64Imm .mov Reg.r0 imm) |>.push .exit
@@ -227,15 +263,37 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
       out := out.push shrunk
       i := i + 1
 
+  -- Inject 0-byte `L__r0:` labels directly before `.exit` inside any rewritten `L: mov64 r0, rK; exit`!
+  let outWithR0 : Array Insn :=
+    if needR0ExitLabels.isEmpty then out
+    else Id.run do
+      let mut res : Array Insn := Array.emptyWithCapacity (out.size + needR0ExitLabels.length)
+      let mut j := 0
+      while j < out.size do
+        match out[j]! with
+        | .label lbl =>
+          if needR0ExitLabels.contains lbl && j + 2 < out.size then
+            match out[j + 1]!, out[j + 2]! with
+            | .alu64Reg .mov d _, .exit =>
+              if d == Reg.r0 then
+                res := res.push (.label lbl) |>.push out[j + 1]! |>.push (.label (lbl ++ "__r0")) |>.push .exit
+                j := j + 3
+                continue
+            | _, _ => pure ()
+        | _ => pure ()
+        res := res.push out[j]!
+        j := j + 1
+      return res
+
   -- Remove unreferenced labels (except `entrypoint` and function labels kept for clarity)
   let mut usedLabels : List String := []
-  for insn in out do
+  for insn in outWithR0 do
     match insn with
     | .ja t | .jccReg _ _ _ t | .jccImm _ _ _ t | .callLocal t =>
       if !usedLabels.contains t then usedLabels := t :: usedLabels
     | _ => pure ()
-  let mut finalOut : Array Insn := Array.emptyWithCapacity out.size
-  for insn in out do
+  let mut finalOut : Array Insn := Array.emptyWithCapacity outWithR0.size
+  for insn in outWithR0 do
     match insn with
     | .label name =>
       if name == "entrypoint" || usedLabels.contains name then

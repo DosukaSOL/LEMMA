@@ -256,6 +256,17 @@ private def computeIntervals (f : Func) (blocks : Array Block) : Array LiveInter
   let mut paramPref : Std.HashMap VReg SBPF.Reg := {}
   for idx in [0:min f.params.size 5] do
     paramPref := paramPref.insert f.params[idx]! argRegs[idx]!
+  -- Caller-side call/syscall argument register preferences (`args[i] → argRegs[i]`):
+  -- eliminates argument-shuffling `mov` chains before local calls and syscalls!
+  for blk in blocks do
+    for s in blk.stmts do
+      match s with
+      | .call _ _ args | .syscall _ _ args =>
+        for idx in [0:min args.size 5] do
+          let av := args[idx]!
+          if !paramPref.contains av then
+            paramPref := paramPref.insert av argRegs[idx]!
+      | _ => pure ()
   -- Hint shared `ret(p)` tail blocks and their incoming edge args to `r1` so error-return edges are 0-insn no-ops!
   let mut sharedRetBlks : Std.HashSet BlockId := {}
   for blk in blocks do

@@ -179,7 +179,11 @@ def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter : Nat) (
       (emitAlu Reg.r0 o2 |>.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
     | .imm _ => (out, cmpCounter)
   | .binOp op dst lhs rhs =>
-    let (lr, o1) := loadVReg alloc lhs Reg.r0 out
+    let lhsScratch : Reg :=
+      match getLoc alloc dst with
+      | .reg dr => if getLoc alloc rhs != .reg dr then dr else Reg.r0
+      | _ => Reg.r0
+    let (lr, o1) := loadVReg alloc lhs lhsScratch out
     let (rr, o2) := loadVReg alloc rhs Reg.r5 o1
     let emitAlu (d s : Reg) (acc : Array Insn) : Array Insn :=
       if op.is32 then acc.push (.alu32Reg op.toAluOp d s)

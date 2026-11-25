@@ -807,7 +807,7 @@ private def shouldAutoOutline (env : Environment) (callCounts : Std.HashMap Name
     | .code body =>
       let sz := codeSize body
       let cnt := callCounts.getD n 0
-      (cnt >= 5 && sz >= 7) || (cnt >= 2 && (sz >= 16 || containsSyscall body)) || sz >= 44
+      (cnt >= 5 && sz >= 12) || (cnt >= 2 && (sz >= 16 || containsSyscall body)) || sz >= 44
     | .extern _ => false
 
 private def nonErasedParamCount (d : Decl .pure) : Nat :=

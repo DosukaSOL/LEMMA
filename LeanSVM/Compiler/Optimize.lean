@@ -98,24 +98,39 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
     | _ => pure ()
 
   for blk in f.blocks do
-    if !blk.params.isEmpty then
+    if blk.id != 0 && !blk.params.isEmpty then
       if let some edges := incomingArgs.get? blk.id then
         if !edges.isEmpty then
           for k in [0:blk.params.size] do
-            let mut common? : Option UInt64 := none
-            let mut allSame := true
+            let p := blk.params[k]!
+            let mut commonC? : Option UInt64 := none
+            let mut allSameC := true
+            let mut commonV? : Option VReg := none
+            let mut allSameV := true
             for edge in edges do
               if k < edge.size then
-                match consts.get? edge[k]! with
-                | some cv =>
-                  match common? with
-                  | none => common? := some cv
-                  | some prev => if prev != cv then allSame := false
-                | none => allSame := false
-              else allSame := false
-            if allSame then
-              if let some cv := common? then
-                consts := consts.insert blk.params[k]! cv
+                let arg := edge[k]!
+                -- Constant propagation across incoming edges (ignoring self-loops `arg == p`)
+                if arg != p then
+                  match consts.get? arg with
+                  | some cv =>
+                    match commonC? with
+                    | none => commonC? := some cv
+                    | some prev => if prev != cv then allSameC := false
+                  | none => allSameC := false
+                  match commonV? with
+                  | none => commonV? := some arg
+                  | some prev => if prev != arg then allSameV := false
+              else
+                allSameC := false
+                allSameV := false
+            if allSameV then
+              if let some v := commonV? then
+                aliases := aliases.insert p v
+                changed := true
+            if allSameC then
+              if let some cv := commonC? then
+                consts := consts.insert p cv
 
   let mut newBlocks : Array Block := Array.emptyWithCapacity f.blocks.size
 

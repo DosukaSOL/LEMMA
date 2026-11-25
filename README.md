@@ -17,7 +17,7 @@ All Rust baselines are zero-dependency `#![no_std]` raw-pointer programs (leaner
 | **Noop** | **352 B** | 1,136 B | **3.23× smaller** | **2 CU** | 2 CU | 0 B |
 | **Counter** (init / inc / add) | **1,040 B** | 1,696 B | **1.63× smaller** | **24 / 29 / 31 CU** | 27 / 32 / 37 CU | 0 B |
 | **Vault** (3 accs + 32B eq + `sol_log_`) | **1,976 B** | 2,304 B | **1.17× smaller** | **167 CU** | 177 CU | 0 B |
-| **DutchAuction** (Token-2022 NFT + Clock + CPI) | **6,896 B** | 12,984 B | **1.88× smaller** | **3,080 / 4,579 CU** | 3,096 / 4,735 CU | 0 B |
+| **DutchAuction** (Token-2022 NFT + Clock + CPI) | **6,832 B** | 12,984 B | **1.90× smaller** | **3,080 / 4,574 CU** | 3,096 / 4,735 CU | 0 B |
 
 ### Full Formally Verified DeFi & NFT Protocol Suite (SPL Token + SPL Token-2022 on LiteSVM)
 
@@ -26,11 +26,11 @@ All Rust baselines are zero-dependency `#![no_std]` raw-pointer programs (leaner
 | [`Examples.Noop`](Examples/Noop.lean) | 2 | 16 B | 0 B | 0 B | **352 B** | 2 | `noop_always_succeeds` |
 | [`Examples.Counter`](Examples/Counter.lean) | 88 | 704 B | 0 B | 0 B | **1,040 B** | 24 / 29 / 31 | `counter_increment_adds_one`, `counter_increment_overflow_rejected` |
 | [`Examples.Vault`](Examples/Vault.lean) | 119 | 952 B | 0 B | 0 B | **1,976 B** | 167 | `vault_transfer_conserves_lamports`, `vault_rejects_insufficient_funds` |
-| [`Examples.HashCheck`](Examples/HashCheck.lean) | 75 | 600 B | 56 B | 0 B | **1,736 B** | 394 | `sol_sha256` + `sol_get_clock_sysvar` + `sol_log_` |
-| [`Examples.Amm`](Examples/Amm.lean) (SPL + Token-2022) | 1,162 | 9,296 B | 384 B | 0 B | **10,224 B** | init 128, addLiq 4,537, swap 4,555, remLiq 4,571 | `amm_swap_preserves_k`, `amm_swap_never_drains_reserve` |
-| [`Examples.Lending`](Examples/Lending.lean) (SPL + Token-2022) | 1,246 | 9,968 B | 384 B | 0 B | **11,024 B** | init 296, dep 1,642, bor 3,379, liq 4,854, rep 3,256 | `lending_repay_monotone`, `lending_healthy_cannot_be_liquidated` |
-| [`Examples.DutchAuction`](Examples/DutchAuction.lean) (Token-2022 NFT) | 736 | 5,888 B | 384 B | 0 B | **6,896 B** | create 3,080, buyNow 4,579 | `dutchPrice_bounded`, `dutchPrice_monotone` |
-| [`Examples.BondingCurve`](Examples/BondingCurve.lean) (Token-2022 Mint/Burn) | 829 | 6,632 B | 304 B | 0 B | **7,592 B** | init 99, buy 4,885, sell 3,625 | `curve_buy_preserves_k`, `curve_sell_bounded_by_reserve` |
+| [`Examples.HashCheck`](Examples/HashCheck.lean) | 74 | 592 B | 56 B | 0 B | **1,728 B** | 393 | `sol_sha256` + `sol_get_clock_sysvar` + `sol_log_` |
+| [`Examples.Amm`](Examples/Amm.lean) (SPL + Token-2022) | 1,127 | 9,016 B | 384 B | 0 B | **9,944 B** | init 127, addLiq 4,533, swap 4,545, remLiq 4,563 | `amm_swap_preserves_k`, `amm_swap_never_drains_reserve` |
+| [`Examples.Lending`](Examples/Lending.lean) (SPL + Token-2022) | 1,179 | 9,432 B | 384 B | 0 B | **10,488 B** | init 295, dep 1,639, bor 3,374, liq 4,828, rep 3,252 | `lending_repay_monotone`, `lending_healthy_cannot_be_liquidated` |
+| [`Examples.DutchAuction`](Examples/DutchAuction.lean) (Token-2022 NFT) | 728 | 5,824 B | 384 B | 0 B | **6,832 B** | create 3,080, buyNow 4,574 | `dutchPrice_bounded`, `dutchPrice_monotone` |
+| [`Examples.BondingCurve`](Examples/BondingCurve.lean) (Token-2022 Mint/Burn) | 813 | 6,504 B | 304 B | 0 B | **7,464 B** | init 99, buy 4,876, sell 3,617 | `curve_buy_preserves_k`, `curve_sell_bounded_by_reserve` |
 
 *(Note: For CPI programs, ~1,200–4,200 CUs of the transaction total come from the SPL Token / Token-2022 / System Program CPI executions themselves; LeanSVM program compute overhead is typically only ~100–400 CUs.)*
 
@@ -92,20 +92,20 @@ Lean 4 Monomorphic LCNF (`Lean.Compiler.LCNF.monoExt`)
 - [`LeanSVM/Math.lean`](LeanSVM/Math.lean) — Overflow-safe 128-bit `mulDiv64` / `mulDiv64Ceil` (fast 64-bit path + shared 128-bit fallback) & Newton `isqrt64`
 - [`LeanSVM/CPI.lean`](LeanSVM/CPI.lean) — Zero-heap stack-allocated `sol_invoke_signed_c` CPIs for **SPL Token**, **SPL Token-2022** (`TransferChecked`, `MintTo`, `Burn`, `InitializeAccount3`), PDA signing, and `SystemProgram` (`Transfer`, PDA-signed `Allocate`, PDA-signed `Assign`)
 - [`LeanSVM/SBPF/`](LeanSVM/SBPF/) — Native sBPF v0/v3 ISA encoder, Murmur3-32 hasher, disassembler, peephole & value-tracking optimizer, and ELF64 `.so` linker
-- [`LeanSVM/Compiler/`](LeanSVM/Compiler/) — `IR`, `Lower`, `Optimize`, `RegAlloc`, `CodeGen`, `Driver`, and **`Proofs`** (56 kernel-checked compiler soundness theorems)
+- [`LeanSVM/Compiler/`](LeanSVM/Compiler/) — `IR`, `Lower`, `Optimize`, `RegAlloc`, `CodeGen`, `Driver`, and **`Proofs`** (60 kernel-checked compiler soundness theorems)
 
 ---
 
 ## Formal Compiler Soundness (`LeanSVM/Compiler/Proofs.lean`)
 
-The production compiler passes (`Lower`, `CodeGen`, `RegAlloc`, `Optimize`, `Peephole`, and `ISA`) are directly machine-checked against a formal small-step sBPF machine semantics in [`LeanSVM/Compiler/Proofs.lean`](LeanSVM/Compiler/Proofs.lean) (**56 theorems, 0 `sorry`, 0 custom axioms**):
+The production compiler passes (`Lower`, `CodeGen`, `RegAlloc`, `Optimize`, `Peephole`, and `ISA`) are directly machine-checked against a formal small-step sBPF machine semantics in [`LeanSVM/Compiler/Proofs.lean`](LeanSVM/Compiler/Proofs.lean) (**60 theorems, 0 `sorry`, 0 custom axioms**):
 
 - **Memory & Stack Disjointness:** `loadBytes_storeBytes_b8_same`, `loadBytes_storeBytes_b1_same`, `loadBytes_storeBytes_b8_nonOverlapping_stack` (proves non-overlapping 8-byte stack-slot invalidation in `bbValueTrackPass`).
 - **ISA Encoding & Constant Materialization:** **`pushRawInsn_roundtrip`** (bit-for-bit 8-byte binary encoding/decoding inverse on production `SBPF.pushRawInsn`), `fitsInt32_signExt32`, `fitsUInt32_zeroExt32`, `emitConst64_sound`, `JmpCond.invert_sound`, `CmpOp.toJmpCond_sound`, `CmpOp.invert_sound`, `CmpOp.flip_sound`, `BinOp.isCommutative_sound`.
 - **Lowering Fallibility Analysis (Closes Transitive Error-Elision Bugs):** **`mayFailCheck_sound`**, **`mayFailCheck_unknown_failSafe`** (proves transitive `codeMayFail` soundness across arbitrary helper call chains and fail-safe rejection of unknown/external callees).
 - **Optimizer Soundness:** `log2IfPow2_spec`, `mul64_pow2_eq_lsh64`, `div64_pow2_eq_rsh64`, `mod64_pow2_eq_and64`, `posInt32_imm_ext_eq`, `opt_algebraic_identities`, `add64_combine_imm_sound`.
-- **Peephole Rewrite Soundness:** `shrinkInsn_sound` (caught and eliminated an unsound `alu32Reg .mov d d` no-op rule), `peephole_mov_ldx_sound`, `peephole_mov_swap_drop_sound`, `peephole_stx_ldx_b8_same_sound`, `peephole_stx_ldx_b8_diff_sound`, `peephole_add64_combine_sound`.
-- **CodeGen Soundness, Cycle-Safe Moves & Zero-Clobber Frame Conditions:** `loadVReg_sound`, `storeVReg_sound`, `emitSingleLocMove_sound`, **`emitParallelLocMoves_regSwap_sound`** (cycle-breaking 2-register swap directly on production `CodeGen.emitParallelLocMoves`), **`emitStmt_cmp_sound`** (proves spill-alias safety when `dst` and `lhs` share `r0`), **`emitStmt_binOp_sound`** (all 21 64/32-bit ops across all reg/stack/imm combinations), `emitStmt_binImm_sound`, `emitStmt_constImm_sound`, `emitStmt_mov_sound`, `emitStmt_neg64_sound`, `emitStmt_load_sound`, `emitStmt_store_sound`, `emitStmt_storeImm_sound`, `emitStmt_loadStack_sound`, `emitStmt_storeStack_sound`, `emitStmt_storeStackImm_sound`, `emitStmt_stackAddr_sound`.
+- **Peephole Rewrite Soundness:** `shrinkInsn_sound`, `peephole_mov_ldx_sound`, `peephole_mov_swap_drop_sound`, `peephole_stx_ldx_b8_same_sound`, `peephole_stx_ldx_b8_diff_sound`, `peephole_add64_combine_sound`, **`overwritesRegWithoutReading_sound`**, **`peephole_fallible_ret_check_sound`** (certifies zero-overhead fallible call return checks), **`peephole_dead_mov_sound`**.
+- **CodeGen Soundness, Cycle-Safe Moves & Zero-Clobber Frame Conditions:** `loadVReg_sound`, `storeVReg_sound`, `emitSingleLocMove_sound`, **`emitParallelLocMoves_regSwap_sound`**, **`emitParallelLocMoves_stackSwap_sound`** (cycle-breaking 2-register and 2-stack-slot swaps directly on production `CodeGen.emitParallelLocMoves`), **`emitStmt_cmp_sound`**, **`emitStmt_binOp_sound`** (all 21 64/32-bit ops with direct `dst` scratch loading across all reg/stack/imm combinations), `emitStmt_binImm_sound`, `emitStmt_constImm_sound`, `emitStmt_mov_sound`, `emitStmt_neg64_sound`, `emitStmt_load_sound`, `emitStmt_store_sound`, `emitStmt_storeImm_sound`, `emitStmt_loadStack_sound`, `emitStmt_storeStack_sound`, `emitStmt_storeStackImm_sound`, `emitStmt_stackAddr_sound`.
 - **RegAlloc Scratch Safety:** `funcUsesScratchR5_complete` (proves `r5` is reserved whenever any `.binOp`, `.cmp`, `.store`, or `.brCmp` reloads a `.stack` or rematerialized `.imm` operand into `r5`).
 - [`Examples/`](Examples/) — 8 formally verified Solana programs (`Noop`, `Counter`, `Vault`, `HashCheck`, `Amm`, `Lending`, `DutchAuction`, `BondingCurve`)
 - [`svm-runner/`](svm-runner/) — Minimal-dependency LiteSVM (`0.11.0` / Agave `3.1.3`) end-to-end test & Rust comparison benchmark runner

@@ -1779,9 +1779,60 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
     unfold evalBinOp
     cases op.is32 <;> simp [execStraight_append, execInsn]
   unfold emitStmt; dsimp only
-  have hRapp := loadVReg_append alloc rhs Reg.r5 (loadVReg alloc lhs Reg.r0 #[]).2
-  have hL := loadVReg_sound alloc lhs Reg.r0 st
-  rcases hpL : loadVReg alloc lhs Reg.r0 #[] with ⟨lr, o1⟩
+  let lhsScratch : Reg :=
+    match getLoc alloc dst with
+    | .reg dr => if getLoc alloc rhs != .reg dr then dr else Reg.r0
+    | _ => Reg.r0
+  have hlhsScr_notR10 : lhsScratch ≠ Reg.r10 := by
+    cases h : getLoc alloc dst with
+    | reg dr =>
+      cases hne : (getLoc alloc rhs != .reg dr) with
+      | true =>
+        have : lhsScratch = dr := by simp only [lhsScratch, h, hne, ↓reduceIte]
+        rw [this]; exact fun heq => hDstNotR10 (h.trans (congrArg Loc.reg heq))
+      | false =>
+        have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h, hne, Bool.false_eq_true, ↓reduceIte]
+        rw [this]; decide
+    | stack _ =>
+      have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h]
+      rw [this]; decide
+    | imm _ =>
+      have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h]
+      rw [this]; decide
+  have hlhsScr_neRhs : Loc.reg lhsScratch ≠ getLoc alloc rhs := by
+    cases h : getLoc alloc dst with
+    | reg dr =>
+      cases hne : (getLoc alloc rhs != .reg dr) with
+      | true =>
+        have : lhsScratch = dr := by simp only [lhsScratch, h, hne, ↓reduceIte]
+        rw [this]; intro heq; rw [← heq] at hne; simp [bne] at hne
+        have hself : (Loc.reg dr == Loc.reg dr) = true := by
+          cases dr with | mk di => change (di == di) = true; simp
+        rw [hself] at hne; cases hne
+      | false =>
+        have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h, hne, Bool.false_eq_true, ↓reduceIte]
+        rw [this]; exact hRhsNotR0.symm
+    | stack _ =>
+      have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h]
+      rw [this]; exact hRhsNotR0.symm
+    | imm _ =>
+      have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h]
+      rw [this]; exact hRhsNotR0.symm
+  have hlhsScr_eq : lhsScratch = Reg.r0 ∨ Loc.reg lhsScratch = getLoc alloc dst := by
+    cases h : getLoc alloc dst with
+    | reg dr =>
+      cases hne : (getLoc alloc rhs != .reg dr) with
+      | true =>
+        have : lhsScratch = dr := by simp only [lhsScratch, h, hne, ↓reduceIte]
+        exact Or.inr (congrArg Loc.reg this)
+      | false =>
+        have : lhsScratch = Reg.r0 := by simp only [lhsScratch, h, hne, Bool.false_eq_true, ↓reduceIte]
+        exact Or.inl this
+    | stack _ => exact Or.inl (by simp only [lhsScratch, h])
+    | imm _ => exact Or.inl (by simp only [lhsScratch, h])
+  have hRapp := loadVReg_append alloc rhs Reg.r5 (loadVReg alloc lhs lhsScratch #[]).2
+  have hL := loadVReg_sound alloc lhs lhsScratch st
+  rcases hpL : loadVReg alloc lhs lhsScratch #[] with ⟨lr, o1⟩
   rw [hpL] at hL hRapp; dsimp only at hL hRapp
   let st1 := execStraight o1.toList st
   have hR := loadVReg_sound alloc rhs Reg.r5 st1
@@ -1792,6 +1843,7 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
     rcases hp : loadVReg alloc rhs Reg.r5 o1 with ⟨r_, o_⟩
     rw [hp] at h; dsimp only at h
     exact Prod.ext h.1 (Array.ext' (by rw [Array.toList_append]; exact h.2))
+  dsimp only
   rw [ho2_eq]; dsimp only
   let st2 := execStraight (o1 ++ o20).toList st
   have hst2_eq : st2 = execStraight o20.toList st1 := by simp [st2, st1, execStraight_append]
@@ -1799,9 +1851,9 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
     rw [hst2_eq]
     have hread : readLoc st1 (getLoc alloc rhs) = readLoc st (getLoc alloc rhs) := by
       cases hr : getLoc alloc rhs with
-      | reg r => exact hL.2.1 r (fun h => hRhsNotR0 (hr.trans (congrArg Loc.reg h)))
+      | reg r => exact hL.2.1 r (fun h => hlhsScr_neRhs ((congrArg Loc.reg h.symm).trans hr.symm))
       | stack off =>
-        have hr10 : st1.regs Reg.r10 = st.regs Reg.r10 := hL.2.1 Reg.r10 (by decide)
+        have hr10 : st1.regs Reg.r10 = st.regs Reg.r10 := hL.2.1 Reg.r10 hlhsScr_notR10.symm
         have hm1 : st1.mem = st.mem := hL.2.2.1
         simp only [readLoc, hr10, hm1]
       | imm v => rfl
@@ -1817,30 +1869,40 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
     | stack _ | imm _ =>
       rw [hr] at hR5Safe
       have hlrNotR5 : lr ≠ Reg.r5 := by
-        have hlrEq := loadVReg_result_reg alloc lhs Reg.r0
+        have hlrEq := loadVReg_result_reg alloc lhs lhsScratch
         rw [hpL] at hlrEq; dsimp only at hlrEq
         cases hl : getLoc alloc lhs with
         | reg r =>
           rw [hl] at hlrEq
           rw [hlrEq]; intro h5; exact hR5Safe.1 (hl.trans (congrArg Loc.reg h5))
         | stack _ | imm _ =>
-          rw [hl] at hlrEq; dsimp only at hlrEq; rw [hlrEq]; decide
+          rw [hl] at hlrEq; dsimp only at hlrEq; rw [hlrEq]
+          rcases hlhsScr_eq with h0 | hd
+          · rw [h0]; decide
+          · intro h5; exact hR5Safe.2 (hd.symm.trans (congrArg Loc.reg h5))
       exact (hR.2.1 lr hlrNotR5).trans hL.1
   have hst2_mem : st2.mem = st.mem := by rw [hst2_eq, hR.2.2.1, hL.2.2.1]
   have hst2_regs : ∀ r', r' ≠ Reg.r0 →
       (match getLoc alloc rhs with | .reg _ => True | _ => r' ≠ Reg.r5) →
+      Loc.reg r' ≠ getLoc alloc dst →
       st2.regs r' = st.regs r' := by
-    intro r' hr0 hr5; rw [hst2_eq]
+    intro r' hr0 hr5 hrdst; rw [hst2_eq]
+    have hneScr : r' ≠ lhsScratch := by
+      rcases hlhsScr_eq with h0 | hd
+      · rw [h0]; exact hr0
+      · intro h; exact hrdst ((congrArg Loc.reg h).trans hd)
     cases hr : getLoc alloc rhs with
     | reg r =>
       have ho20nil : o20 = #[] := by
         have : loadVReg alloc rhs Reg.r5 #[] = (r, #[]) := by simp [loadVReg, hr]
         rw [hpR] at this; exact (Prod.mk.inj this).2
-      rw [ho20nil]; exact hL.2.1 r' hr0
+      rw [ho20nil]; exact hL.2.1 r' hneScr
     | stack _ | imm _ =>
-      rw [hr] at hr5; exact (hR.2.1 r' hr5).trans (hL.2.1 r' hr0)
+      rw [hr] at hr5; exact (hR.2.1 r' hr5).trans (hL.2.1 r' hneScr)
   have hst2_r10 : st2.regs Reg.r10 = st.regs Reg.r10 :=
-    hst2_regs Reg.r10 (by decide) (by cases getLoc alloc rhs with | reg _ => trivial | stack _ => simp only []; decide | imm _ => simp only []; decide)
+    hst2_regs Reg.r10 (by decide)
+      (by cases getLoc alloc rhs with | reg _ => trivial | stack _ => simp only []; decide | imm _ => simp only []; decide)
+      hDstNotR10.symm
   cases hdst : getLoc alloc dst with
   | imm val => exact absurd hdst (hDstNotImm val)
   | reg dr =>
@@ -1856,7 +1918,7 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
       · rw [readLoc, setReg_same, hdrlr, hst2_lr, hst2_rr]
       · intro r' hr0 hr5 hrdst
         have hne : r' ≠ dr := fun h => hrdst (congrArg Loc.reg h)
-        rw [setReg_ne _ dr r' _ hne]; exact hst2_regs r' hr0 hr5
+        rw [setReg_ne _ dr r' _ hne]; exact hst2_regs r' hr0 hr5 (hdst.symm ▸ hrdst)
       · intro o _
         simp only [readLoc, setReg_mem, setReg_ne _ dr Reg.r10 _ hdr10.symm, hst2_r10, hst2_mem]
     | false =>
@@ -1872,7 +1934,7 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
           · rw [readLoc, setReg_same, hdrrr, hst2_rr, hst2_lr, BinOp.isCommutative_sound op hcomm]
           · intro r' hr0 hr5 hrdst
             have hne : r' ≠ dr := fun h => hrdst (congrArg Loc.reg h)
-            rw [setReg_ne _ dr r' _ hne]; exact hst2_regs r' hr0 hr5
+            rw [setReg_ne _ dr r' _ hne]; exact hst2_regs r' hr0 hr5 (hdst.symm ▸ hrdst)
           · intro o _
             simp only [readLoc, setReg_mem, setReg_ne _ dr Reg.r10 _ hdr10.symm, hst2_r10, hst2_mem]
         | false =>
@@ -1886,7 +1948,7 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
           · intro r' hr0 hr5 hrdst
             have hne : r' ≠ dr := fun h => hrdst (congrArg Loc.reg h)
             rw [setReg_ne _ dr r' _ hne, setReg_ne _ Reg.r0 r' _ hr0, setReg_ne _ Reg.r0 r' _ hr0]
-            exact hst2_regs r' hr0 hr5
+            exact hst2_regs r' hr0 hr5 (hdst.symm ▸ hrdst)
           · intro o _
             simp only [readLoc, setReg_mem, setReg_ne _ dr Reg.r10 _ hdr10.symm,
               setReg_ne _ Reg.r0 Reg.r10 _ (by decide), hst2_r10, hst2_mem]
@@ -1900,7 +1962,7 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
         · rw [readLoc, setReg_same, hst2_lr, hst2_rr]
         · intro r' hr0 hr5 hrdst
           have hne : r' ≠ dr := fun h => hrdst (congrArg Loc.reg h)
-          rw [setReg_ne _ dr r' _ hne, setReg_ne _ dr r' _ hne]; exact hst2_regs r' hr0 hr5
+          rw [setReg_ne _ dr r' _ hne, setReg_ne _ dr r' _ hne]; exact hst2_regs r' hr0 hr5 (hdst.symm ▸ hrdst)
         · intro o _
           simp only [readLoc, setReg_mem, setReg_ne _ dr Reg.r10 _ hdr10.symm, hst2_r10, hst2_mem]
   | stack off =>
@@ -1934,13 +1996,16 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
       | false => simp only [Bool.false_eq_true, ↓reduceIte, setReg_mem]; exact hst2_mem
     have ho3_regs : ∀ r', r' ≠ Reg.r0 →
         (match getLoc alloc rhs with | .reg _ => True | _ => r' ≠ Reg.r5) →
+        Loc.reg r' ≠ getLoc alloc dst →
         (execStraight o3.toList st).regs r' = st.regs r' := by
-      intro r' hr0 hr5; rw [ho3]
+      intro r' hr0 hr5 hrdst; rw [ho3]
       cases hlr0 : (lr == Reg.r0) with
-      | true => simp only [↓reduceIte]; exact hst2_regs r' hr0 hr5
-      | false => simp only [Bool.false_eq_true, ↓reduceIte, setReg_ne _ Reg.r0 r' _ hr0]; exact hst2_regs r' hr0 hr5
+      | true => simp only [↓reduceIte]; exact hst2_regs r' hr0 hr5 hrdst
+      | false => simp only [Bool.false_eq_true, ↓reduceIte, setReg_ne _ Reg.r0 r' _ hr0]; exact hst2_regs r' hr0 hr5 hrdst
     have ho3_r10 : (execStraight o3.toList st).regs Reg.r10 = st.regs Reg.r10 :=
-      ho3_regs Reg.r10 (by decide) (by cases getLoc alloc rhs with | reg _ => trivial | stack _ => simp only []; decide | imm _ => simp only []; decide)
+      ho3_regs Reg.r10 (by decide)
+        (by cases getLoc alloc rhs with | reg _ => trivial | stack _ => simp only []; decide | imm _ => simp only []; decide)
+        hDstNotR10.symm
     have hExecSt :
         execStraight
           ((if op.is32 then o3.push (.alu32Reg op.toAluOp Reg.r0 rr)
@@ -1967,8 +2032,8 @@ theorem emitStmt_binOp_sound (f : Func) (alloc : AllocResult) (op : BinOp)
     refine ⟨?_, ?_, ?_⟩
     · simp only [readLoc, setMem_regs, setMem_mem, setReg_ne _ Reg.r0 Reg.r10 _ (by decide),
         ho3_r10, loadBytes_storeBytes_b8_same]
-    · intro r' hr0 hr5 _
-      rw [setMem_regs, setReg_ne _ Reg.r0 r' _ hr0]; exact ho3_regs r' hr0 hr5
+    · intro r' hr0 hr5 hne
+      rw [setMem_regs, setReg_ne _ Reg.r0 r' _ hr0]; exact ho3_regs r' hr0 hr5 (hdst.symm ▸ hne)
     · intro o hdisj
       simp only [readLoc, setMem_regs, setMem_mem, setReg_ne _ Reg.r0 Reg.r10 _ (by decide), ho3_r10]
       exact loadBytes_storeBytes_b8_nonOverlapping_stack st.mem (st.regs Reg.r10) o off _ (hdisj off rfl)
@@ -2806,5 +2871,159 @@ theorem emitParallelLocMoves_regSwap_sound (a b : Reg) (st : MachState)
   · rw [setReg_ne _ a Reg.r0 _ ha0.symm, setReg_same]
   · intro r' hr0 hra hrb
     rw [setReg_ne _ b r' _ hrb, setReg_ne _ a r' _ hra, setReg_ne _ Reg.r0 r' _ hr0]
+
+/-! ## 12. New Peephole & Stack-Cycle Soundness Proofs -/
+
+/-- **THEOREM (`Peephole.overwritesRegWithoutReading` Soundness)**:
+    Whenever `overwritesRegWithoutReading r insn = true` and `insn` is a straight-line instruction,
+    overwriting `r` beforehand (`st.setReg r v`) has ZERO effect on the post-state of `execInsn insn`! -/
+theorem overwritesRegWithoutReading_sound (r : Reg) (v : UInt64) (insn : Insn) (st : MachState)
+    (hov : overwritesRegWithoutReading r insn = true) :
+    execInsn insn (st.setReg r v) = execInsn insn st := by
+  cases insn with
+  | alu64Imm op d imm =>
+    cases op <;> simp [overwritesRegWithoutReading] at hov
+    subst hov
+    cases st; simp [execInsn, evalAlu64, MachState.setReg]
+    funext r'; by_cases h : r' = d <;> simp [h]
+  | alu32Imm op d imm =>
+    cases op <;> simp [overwritesRegWithoutReading] at hov
+    subst hov
+    cases st; simp [execInsn, evalAlu32, MachState.setReg]
+    funext r'; by_cases h : r' = d <;> simp [h]
+  | lddw d imm =>
+    simp [overwritesRegWithoutReading] at hov
+    subst hov
+    cases st; simp [execInsn, MachState.setReg]
+    funext r'; by_cases h : r' = d <;> simp [h]
+  | lddwRodata d off =>
+    simp [overwritesRegWithoutReading] at hov
+    subst hov
+    cases st; simp [execInsn, MachState.setReg]
+    funext r'; by_cases h : r' = d <;> simp [h]
+  | alu64Reg op d s =>
+    cases op <;> simp [overwritesRegWithoutReading] at hov
+    rcases hov with ⟨rfl, hsr⟩
+    cases st; simp [execInsn, evalAlu64, MachState.setReg]
+    funext r'; by_cases h : r' = d <;> simp [h, hsr]
+  | ldx sz d base off =>
+    simp [overwritesRegWithoutReading] at hov
+    rcases hov with ⟨rfl, hbr⟩
+    cases st; simp [execInsn, MachState.setReg]
+    funext r'; by_cases h : r' = d <;> simp [h, hbr]
+  | _ =>
+    simp [overwritesRegWithoutReading] at hov
+
+/-- **THEOREM (Zero-Overhead Fallible Call Check Peephole Soundness)**:
+    Rewriting `mov64 k, r0; jne k, 0, L; nxt` (where `L: mov64 r0, k; exit` and `nxt`
+    overwrites `k` without reading `k`) into `jne r0, 0, L__r0; nxt` (where `L__r0: exit`)
+    is 100% semantically identical on BOTH branches:
+    1. Error path (`r0 ≠ 0`): both return the exact same `st.regs r0`.
+    2. Hot path (`r0 = 0`): `execStraight [.alu64Reg .mov k r0, nxt] st = execStraight [nxt] st`! -/
+theorem peephole_fallible_ret_check_sound (k : Reg) (nxt : Insn) (st : MachState)
+    (hov : overwritesRegWithoutReading k nxt = true) :
+    (execInsn (.alu64Reg .mov Reg.r0 k) (execInsn (.alu64Reg .mov k Reg.r0) st)).regs Reg.r0 = st.regs Reg.r0 ∧
+    execStraight [.alu64Reg .mov k Reg.r0, nxt] st = execStraight [nxt] st := by
+  constructor
+  · simp [execInsn, evalAlu64]
+  · simp only [execStraight_cons, execStraight_nil, execInsn, evalAlu64]
+    exact overwritesRegWithoutReading_sound k (st.regs Reg.r0) nxt st hov
+
+/-- **THEOREM (Dead Move Elimination Peephole Soundness)**:
+    All 3 dead-move elimination rules in `Peephole.lean` preserve exact machine state! -/
+theorem peephole_dead_mov_sound (a b : Reg) (imm1 imm2 : Int32) (st : MachState) (hab : a ≠ b) :
+    execStraight [.alu64Imm .mov a imm1, .alu64Imm .mov a imm2] st =
+      execStraight [.alu64Imm .mov a imm2] st ∧
+    execStraight [.alu64Reg .mov a b, .alu64Imm .mov a imm2] st =
+      execStraight [.alu64Imm .mov a imm2] st ∧
+    execStraight [.alu64Imm .mov a imm1, .alu64Reg .mov a b] st =
+      execStraight [.alu64Reg .mov a b] st := by
+  refine ⟨?_, ?_, ?_⟩
+  · cases st; simp [execStraight, execInsn, evalAlu64, MachState.setReg]
+    funext r; by_cases h : r = a <;> simp [h]
+  · cases st; simp [execStraight, execInsn, evalAlu64, MachState.setReg]
+    funext r; by_cases h : r = a <;> simp [h]
+  · cases st; simp [execStraight, execInsn, evalAlu64, MachState.setReg]
+    funext r; by_cases h : r = a <;> simp [h, hab.symm]
+
+/-- **THEOREM (`CodeGen.emitParallelLocMoves` Stack-Slot 2-Swap Cycle Soundness)**:
+    Swapping any two non-overlapping 8-byte stack slots `(s1, s2)` via
+    `emitParallelLocMoves #[(.stack s1, .stack s2), (.stack s2, .stack s1)] r0 r5`
+    exchanges their 64-bit values atomically and preserves every register `r' ∉ {r0, r5}`
+    and every disjoint stack slot! -/
+theorem emitParallelLocMoves_stackSwap_sound (s1 s2 : Int16) (st : MachState)
+    (hdisj : Int.natAbs (s1.toInt - s2.toInt) ≥ 8) :
+    let st' := execStraight
+      (emitParallelLocMoves #[(.stack s1, .stack s2), (.stack s2, .stack s1)] Reg.r0 Reg.r5 #[]).toList st
+    readLoc st' (.stack s1) = readLoc st (.stack s2) ∧
+    readLoc st' (.stack s2) = readLoc st (.stack s1) ∧
+    (∀ r', r' ≠ Reg.r0 → r' ≠ Reg.r5 → st'.regs r' = st.regs r') := by
+  have hne : s1 ≠ s2 := by intro h; subst h; simp at hdisj
+  have hdisj21 : Int.natAbs (s2.toInt - s1.toInt) ≥ 8 := by omega
+  have h12 : (Loc.stack s1 == Loc.stack s2) = false := by
+    change (s1 == s2) = false; exact beq_false_of_ne hne
+  have h21 : (Loc.stack s2 == Loc.stack s1) = false := by
+    change (s2 == s1) = false; exact beq_false_of_ne hne.symm
+  have h11 : (Loc.stack s1 == Loc.stack s1) = true := by
+    change (s1 == s1) = true; simp
+  have h22 : (Loc.stack s2 == Loc.stack s2) = true := by
+    change (s2 == s2) = true; simp
+  have hEmit : emitParallelLocMoves #[(.stack s1, .stack s2), (.stack s2, .stack s1)] Reg.r0 Reg.r5 #[] =
+      #[.ldx .b8 Reg.r0 Reg.r10 s1,
+        .ldx .b8 Reg.r5 Reg.r10 s2,
+        .stx .b8 Reg.r10 Reg.r5 s1,
+        .stx .b8 Reg.r10 Reg.r0 s2] := by
+    unfold emitParallelLocMoves
+    have hfilt : (#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).filter (fun p => p.1 != p.2) =
+        #[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)] := by
+      simp [bne, h12, h21]
+    rw [hfilt]; dsimp only
+    have hfuel : (#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).size * 4 + 16 = 24 := rfl
+    rw [hfuel]
+    have hne1 : (#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).isEmpty = false := rfl
+    have hfind1 : (#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).findIdx?
+        (fun m => !(#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).any (fun p => p.2 == m.1)) = none := by
+      simp [Array.findIdx?, Array.findIdx?.loop, Array.any, Array.anyM, Array.anyM.loop, h21, h11, h22]
+    have hmap1 : ((#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).eraseIdx! 0).map
+        (fun p => if (p.2 == Loc.stack s1) = true then (p.1, Loc.reg Reg.r0) else p) =
+        #[(Loc.stack s2, Loc.reg Reg.r0)] := by
+      simp [Array.eraseIdx!, h11]
+    rw [emitParallelLocMovesLoop, hne1]; simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [hfind1]; dsimp only
+    change emitParallelLocMovesLoop 23
+        (((#[(Loc.stack s1, Loc.stack s2), (Loc.stack s2, Loc.stack s1)]).eraseIdx! 0).map
+          (fun p => if (p.2 == Loc.stack s1) = true then (p.1, Loc.reg Reg.r0) else p))
+        Reg.r0 Reg.r5
+        #[.ldx .b8 Reg.r0 Reg.r10 s1, .ldx .b8 Reg.r5 Reg.r10 s2, .stx .b8 Reg.r10 Reg.r5 s1] = _
+    rw [hmap1]
+    have h0s2 : (Loc.reg Reg.r0 == Loc.stack s2) = false := rfl
+    have hne2 : (#[(Loc.stack s2, Loc.reg Reg.r0)]).isEmpty = false := rfl
+    have hfind2 : (#[(Loc.stack s2, Loc.reg Reg.r0)]).findIdx?
+        (fun m => !(#[(Loc.stack s2, Loc.reg Reg.r0)]).any (fun p => p.2 == m.1)) = some 0 := by
+      simp [Array.findIdx?, Array.findIdx?.loop, Array.any, Array.anyM, Array.anyM.loop, h0s2]
+    rw [emitParallelLocMovesLoop, hne2]; simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [hfind2]; dsimp only
+    have herase2 : (#[(Loc.stack s2, Loc.reg Reg.r0)]).eraseIdx! 0 = #[] := by simp [Array.eraseIdx!]
+    rw [herase2]
+    change emitParallelLocMovesLoop 22 #[] Reg.r0 Reg.r5
+        #[.ldx .b8 Reg.r0 Reg.r10 s1, .ldx .b8 Reg.r5 Reg.r10 s2, .stx .b8 Reg.r10 Reg.r5 s1, .stx .b8 Reg.r10 Reg.r0 s2] = _
+    rw [emitParallelLocMovesLoop]; rfl
+  dsimp only; rw [hEmit]
+  have hList : (#[.ldx .b8 Reg.r0 Reg.r10 s1, .ldx .b8 Reg.r5 Reg.r10 s2,
+      .stx .b8 Reg.r10 Reg.r5 s1, .stx .b8 Reg.r10 Reg.r0 s2] : Array Insn).toList =
+      [.ldx .b8 Reg.r0 Reg.r10 s1, .ldx .b8 Reg.r5 Reg.r10 s2,
+       .stx .b8 Reg.r10 Reg.r5 s1, .stx .b8 Reg.r10 Reg.r0 s2] := rfl
+  rw [hList]
+  simp only [execStraight_cons, execStraight_nil, execInsn, readLoc, setReg_same, setReg_mem, setMem_regs, setMem_mem]
+  have hr10_0 : Reg.r10 ≠ Reg.r0 := by decide
+  have hr10_5 : Reg.r10 ≠ Reg.r5 := by decide
+  have hr0_5  : Reg.r0  ≠ Reg.r5 := by decide
+  simp only [setReg_ne _ Reg.r0 Reg.r10 _ hr10_0, setReg_ne _ Reg.r5 Reg.r10 _ hr10_5,
+    setReg_ne _ Reg.r5 Reg.r0 _ hr0_5, setReg_same]
+  refine ⟨?_, ?_, ?_⟩
+  · rw [loadBytes_storeBytes_b8_nonOverlapping_stack _ _ s1 s2 _ hdisj, loadBytes_storeBytes_b8_same]
+  · rw [loadBytes_storeBytes_b8_same]
+  · intro r' hr0 hr5
+    rw [setReg_ne _ Reg.r5 r' _ hr5, setReg_ne _ Reg.r0 r' _ hr0]
 
 end LeanSVM.Compiler.Proofs
