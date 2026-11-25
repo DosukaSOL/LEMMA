@@ -52,10 +52,21 @@ def shrinkInsn : Insn → Option Insn
 
 /-- Single pass of peephole optimizations on a symbolic sBPF instruction stream. -/
 private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
-  let mut out : Array Insn := Array.emptyWithCapacity insns.size
+  -- Pre-scan labels that immediately point to `.exit` (for jump-to-exit forwarding!)
+  let mut exitLabels : List String := []
+  let n := insns.size
+  for k in [0:n] do
+    match insns[k]! with
+    | .label lbl =>
+      if k + 1 < n then
+        match insns[k + 1]! with
+        | .exit => if !exitLabels.contains lbl then exitLabels := lbl :: exitLabels
+        | _ => pure ()
+    | _ => pure ()
+
+  let mut out : Array Insn := Array.emptyWithCapacity n
   let mut changed := false
   let mut i := 0
-  let n := insns.size
   let mut dead := false
   while i < n do
     let cur := insns[i]!
@@ -113,7 +124,33 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
             changed := true
             i := i + 3
             continue
+        -- Branch-over-jump inversion: `jcc cond, L1; ja L2; L1:` -> `jcc (invert cond), L2; L1:`!
+        | .jccReg cond d s l1, .ja l2, .label l1' =>
+          if l1 == l1' then
+            if let some inv := cond.invert then
+              out := out.push (.jccReg inv d s l2) |>.push (.label l1')
+              changed := true
+              i := i + 3
+              continue
+        | .jccImm cond d imm l1, .ja l2, .label l1' =>
+          if l1 == l1' then
+            if let some inv := cond.invert then
+              out := out.push (.jccImm inv d imm l2) |>.push (.label l1')
+              changed := true
+              i := i + 3
+              continue
         | _, _, _ => pure ()
+
+      -- Jump-to-exit forwarding: `ja exit_lbl` -> `exit`! (Turns `call fn; ja exit` into `call fn; exit`!)
+      match shrunk with
+      | .ja tgt =>
+        if exitLabels.contains tgt then
+          out := out.push .exit
+          dead := true
+          changed := true
+          i := i + 1
+          continue
+      | _ => pure ()
 
       -- Two-instruction window peepholes
       if i + 1 < n then
@@ -124,6 +161,13 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
           if tgt == lbl then
             changed := true
             i := i + 1
+            continue
+        -- `mov64 rA, rB; ldx rA, [rA+off]` -> `ldx rA, [rB+off]`!
+        | .alu64Reg .mov a b, .ldx sz d s off =>
+          if a == d && a == s then
+            out := out.push (.ldx sz d b off)
+            changed := true
+            i := i + 2
             continue
         -- `mov64 rA, rB; mov64 rB, rA` -> drop second move
         | .alu64Reg .mov a b, .alu64Reg .mov b2 a2 =>

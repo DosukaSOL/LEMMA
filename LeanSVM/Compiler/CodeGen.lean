@@ -28,19 +28,6 @@ private def blkLabel (f : Func) (id : BlockId) : String :=
 private def getLoc (alloc : AllocResult) (v : VReg) : Loc :=
   alloc.locs.getD v (.reg Reg.r0)
 
-/-- Load `v` into a physical register (no instruction if already in a register). -/
-private def loadVReg (alloc : AllocResult) (v : VReg) (scratch : Reg) (out : Array Insn) :
-    Reg × Array Insn :=
-  match getLoc alloc v with
-  | .reg r => (r, out)
-  | .stack off => (scratch, out.push (.ldx .b8 scratch Reg.r10 off))
-
-/-- Store result register `src` into `v`'s allocated location. -/
-private def storeVReg (alloc : AllocResult) (v : VReg) (src : Reg) (out : Array Insn) : Array Insn :=
-  match getLoc alloc v with
-  | .reg r => if r == src then out else out.push (.alu64Reg .mov r src)
-  | .stack off => out.push (.stx .b8 Reg.r10 src off)
-
 /-- Emit a 64-bit constant into `dst` using the shortest sBPF encoding (`mov64`, `mov32`, or `lddw`). -/
 private def emitConst64 (dst : Reg) (val : UInt64) (out : Array Insn) : Array Insn :=
   match fitsInt32 val with
@@ -49,6 +36,21 @@ private def emitConst64 (dst : Reg) (val : UInt64) (out : Array Insn) : Array In
     match fitsUInt32 val with
     | some i32 => out.push (.alu32Imm .mov dst i32)
     | none => out.push (.lddw dst val)
+
+/-- Load `v` into a physical register (no instruction if already in a register). -/
+private def loadVReg (alloc : AllocResult) (v : VReg) (scratch : Reg) (out : Array Insn) :
+    Reg × Array Insn :=
+  match getLoc alloc v with
+  | .reg r => (r, out)
+  | .stack off => (scratch, out.push (.ldx .b8 scratch Reg.r10 off))
+  | .imm val => (scratch, emitConst64 scratch val out)
+
+/-- Store result register `src` into `v`'s allocated location. -/
+private def storeVReg (alloc : AllocResult) (v : VReg) (src : Reg) (out : Array Insn) : Array Insn :=
+  match getLoc alloc v with
+  | .reg r => if r == src then out else out.push (.alu64Reg .mov r src)
+  | .stack off => out.push (.stx .b8 Reg.r10 src off)
+  | .imm _ => out
 
 /-- Emit cycle-safe parallel register/stack moves: `dsts[i] := srcs[i]`.
     `cycleTmp` (`r0`) breaks pure cycles; `memTmp` (`r5`, reserved whenever spills occur)
@@ -74,22 +76,35 @@ private def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (
       acc := match dst, src with
         | .reg dr, .reg sr     => acc.push (.alu64Reg .mov dr sr)
         | .reg dr, .stack soff => acc.push (.ldx .b8 dr Reg.r10 soff)
+        | .reg dr, .imm val    => emitConst64 dr val acc
         | .stack doff, .reg sr => acc.push (.stx .b8 Reg.r10 sr doff)
         | .stack doff, .stack soff =>
           acc.push (.ldx .b8 memTmp Reg.r10 soff) |>.push (.stx .b8 Reg.r10 memTmp doff)
+        | .stack doff, .imm val =>
+          match fitsInt32 val with
+          | some i32 => acc.push (.stImm .b8 Reg.r10 doff i32)
+          | none => emitConst64 memTmp val acc |>.push (.stx .b8 Reg.r10 memTmp doff)
+        | .imm _, _ => acc
     | none =>
       let (dst, src) := pending[0]!
       pending := pending.eraseIdx! 0
       acc := match dst with
         | .reg dr => acc.push (.alu64Reg .mov cycleTmp dr)
         | .stack doff => acc.push (.ldx .b8 cycleTmp Reg.r10 doff)
+        | .imm _ => acc
       pending := pending.map (fun p => if p.2 == dst then (p.1, .reg cycleTmp) else p)
       acc := match dst, src with
         | .reg dr, .reg sr     => acc.push (.alu64Reg .mov dr sr)
         | .reg dr, .stack soff => acc.push (.ldx .b8 dr Reg.r10 soff)
+        | .reg dr, .imm val    => emitConst64 dr val acc
         | .stack doff, .reg sr => acc.push (.stx .b8 Reg.r10 sr doff)
         | .stack doff, .stack soff =>
           acc.push (.ldx .b8 memTmp Reg.r10 soff) |>.push (.stx .b8 Reg.r10 memTmp doff)
+        | .stack doff, .imm val =>
+          match fitsInt32 val with
+          | some i32 => acc.push (.stImm .b8 Reg.r10 doff i32)
+          | none => emitConst64 memTmp val acc |>.push (.stx .b8 Reg.r10 memTmp doff)
+        | .imm _, _ => acc
   return acc
 
 /-- Emit block-parameter edge moves from `args` into `targetBlock.params`. -/
@@ -114,37 +129,51 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
     match getLoc alloc dst with
     | .reg dr => (emitConst64 dr val out, cmpCounter)
     | .stack off =>
-      let o1 := emitConst64 Reg.r0 val out
-      (o1.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
+      match fitsInt32 val with
+      | some i32 => (out.push (.stImm .b8 Reg.r10 off i32), cmpCounter)
+      | none =>
+        let o1 := emitConst64 Reg.r0 val out
+        (o1.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .constRodata dst roOff =>
     match getLoc alloc dst with
     | .reg dr => (out.push (.lddwRodata dr roOff), cmpCounter)
     | .stack off =>
       (out.push (.lddwRodata Reg.r0 roOff) |>.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .mov dst src =>
-    let (sr, o1) := loadVReg alloc src Reg.r0 out
-    (storeVReg alloc dst sr o1, cmpCounter)
-  | .neg64 dst src =>
-    let (sr, o1) := loadVReg alloc src Reg.r0 out
     match getLoc alloc dst with
     | .reg dr =>
+      let (sr, o1) := loadVReg alloc src dr out
+      (if dr == sr then o1 else o1.push (.alu64Reg .mov dr sr), cmpCounter)
+    | _ =>
+      let (sr, o1) := loadVReg alloc src Reg.r0 out
+      (storeVReg alloc dst sr o1, cmpCounter)
+  | .neg64 dst src =>
+    match getLoc alloc dst with
+    | .reg dr =>
+      let (sr, o1) := loadVReg alloc src dr out
       let o2 := if dr == sr then o1 else o1.push (.alu64Reg .mov dr sr)
       (o2.push (.neg64 dr), cmpCounter)
     | .stack off =>
+      let (sr, o1) := loadVReg alloc src Reg.r0 out
       let o2 := if sr == Reg.r0 then o1 else o1.push (.alu64Reg .mov Reg.r0 sr)
       (o2.push (.neg64 Reg.r0) |>.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .binImm op dst lhs imm =>
-    let (lr, o1) := loadVReg alloc lhs Reg.r0 out
     let emitAlu (d : Reg) (acc : Array Insn) : Array Insn :=
       if op.is32 then acc.push (.alu32Imm op.toAluOp d imm)
       else acc.push (.alu64Imm op.toAluOp d imm)
     match getLoc alloc dst with
     | .reg dr =>
+      let (lr, o1) := loadVReg alloc lhs dr out
       let o2 := if dr == lr then o1 else o1.push (.alu64Reg .mov dr lr)
       (emitAlu dr o2, cmpCounter)
     | .stack off =>
+      let (lr, o1) := loadVReg alloc lhs Reg.r0 out
       let o2 := if lr == Reg.r0 then o1 else o1.push (.alu64Reg .mov Reg.r0 lr)
       (emitAlu Reg.r0 o2 |>.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .binOp op dst lhs rhs =>
     let (lr, o1) := loadVReg alloc lhs Reg.r0 out
     let (rr, o2) := loadVReg alloc rhs Reg.r5 o1
@@ -170,6 +199,7 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
       let o3 := if lr == Reg.r0 then o2 else o2.push (.alu64Reg .mov Reg.r0 lr)
       let o4 := emitAlu Reg.r0 rr o3
       (o4.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .cmp op dst lhs rhs =>
     let (lr, o1) := loadVReg alloc lhs Reg.r0 out
     let (rr, o2) := loadVReg alloc rhs Reg.r5 o1
@@ -177,7 +207,7 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
     let targetReg :=
       match getLoc alloc dst with
       | .reg dr => if dr != lr && dr != rr then dr else Reg.r0
-      | .stack _ => Reg.r0
+      | .stack _ | .imm _ => Reg.r0
     let o3 := o2
       |>.push (.alu64Imm .mov targetReg 1)
       |>.push (.jccReg op.toJmpCond lr rr doneLbl)
@@ -185,11 +215,14 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
       |>.push (.label doneLbl)
     (storeVReg alloc dst targetReg o3, cmpCounter + 1)
   | .load sz dst base off =>
-    let (br, o1) := loadVReg alloc base Reg.r0 out
     match getLoc alloc dst with
-    | .reg dr => (o1.push (.ldx sz dr br off), cmpCounter)
+    | .reg dr =>
+      let (br, o1) := loadVReg alloc base dr out
+      (o1.push (.ldx sz dr br off), cmpCounter)
     | .stack soff =>
+      let (br, o1) := loadVReg alloc base Reg.r0 out
       (o1.push (.ldx sz Reg.r0 br off) |>.push (.stx .b8 Reg.r10 Reg.r0 soff), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .store sz base off val =>
     let (br, o1) := loadVReg alloc base Reg.r0 out
     let (vr, o2) := loadVReg alloc val Reg.r5 o1
@@ -202,6 +235,7 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
     | .reg dr => (out.push (.ldx sz dr Reg.r10 off), cmpCounter)
     | .stack soff =>
       (out.push (.ldx sz Reg.r0 Reg.r10 off) |>.push (.stx .b8 Reg.r10 Reg.r0 soff), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .storeStack sz off val =>
     let (vr, o1) := loadVReg alloc val Reg.r0 out
     (o1.push (.stx sz Reg.r10 vr off), cmpCounter)
@@ -215,6 +249,7 @@ private def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter 
       (out.push (.alu64Reg .mov Reg.r0 Reg.r10)
         |>.push (.alu64Imm .add Reg.r0 (Int32.ofInt stackOff.toInt))
         |>.push (.stx .b8 Reg.r10 Reg.r0 soff), cmpCounter)
+    | .imm _ => (out, cmpCounter)
   | .syscall dst? sym args =>
     let argRegs := #[Reg.r1, Reg.r2, Reg.r3, Reg.r4, Reg.r5]
     let n := min args.size 5

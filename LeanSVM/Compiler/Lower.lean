@@ -58,6 +58,8 @@ structure LowerState where
   nextVReg        : Nat := 0
   rodata          : RodataPool := {}
   stackAllocBytes : Nat := 0
+  /-- Reusable 8-byte stack slot for fallible outlined `SolanaM α` helper out-pointers. -/
+  callRetSlotOff? : Option Int16 := none
   /-- Stack of active inlined-function frames for tail-recursion loop detection. -/
   activeRecLoops  : List (Name × BlockId × Array VReg × Array Bool) := []
   /-- Outlined pure scalar helper functions (compiled once, called via 1-CU sBPF `call`). -/
@@ -123,6 +125,24 @@ private def allocStack (size : Nat) : LowerM VReg := do
   emit (.stackAddr r (Int16.ofInt (-(newTotal : Int))))
   return r
 
+/-- Reuse ONE single 8-byte stack slot per function for fallible scalar helper out-pointers. -/
+private def getOrAllocCallRetSlot : LowerM (VReg × Int16) := do
+  let st ← get
+  match st.callRetSlotOff? with
+  | some sOff =>
+    let r ← freshVReg
+    emit (.stackAddr r sOff)
+    return (r, sOff)
+  | none =>
+    let newTotal := st.stackAllocBytes + 8
+    if newTotal > 4096 then
+      throw s!"stack allocation exceeds Solana 4KB frame limit ({newTotal} bytes)"
+    let sOff := Int16.ofInt (-(newTotal : Int))
+    set { st with stackAllocBytes := newTotal, callRetSlotOff? := some sOff }
+    let r ← freshVReg
+    emit (.stackAddr r sOff)
+    return (r, sOff)
+
 /-- Materialize a `Val` as a single scalar `VReg`. -/
 private def valToReg (v : Val) : LowerM VReg := do
   match v with
@@ -131,6 +151,7 @@ private def valToReg (v : Val) : LowerM VReg := do
   | .erased => emitConst 0
   | .ctorVal tag #[] => emitConst tag.toUInt64
   | .ctorVal tag #[.erased] => emitConst tag.toUInt64
+  | .ctorVal 0 #[a, .erased] => valToReg a
   | .ctorVal tag #[a] =>
     -- Single-field wrapper (e.g. `UInt64.mk`, `BitVec.ofFin`, `Fin.mk`)
     if tag == 0 then valToReg a else emitConst tag.toUInt64
@@ -320,20 +341,62 @@ private def tryLowerPrimitive (declName : Name) (vals : Array Val) : LowerM (Opt
     let sizeNat ← match valToConstNat? sizeVal with
       | some n => pure n
       | none =>
-        -- Check if sizeVal came from a constImm in the current block
         match sizeVal with
         | .reg vr =>
           let st ← get
-          let mut found? : Option Nat := none
+          -- Build constant + alias map across lowered blocks (including constant block params!)
+          let mut constMap : Std.HashMap VReg UInt64 := {}
           for blk in st.blocks do
             for s in blk.stmts do
               match s with
-              | .constImm d c => if d == vr then found? := some c.toNat
+              | .constImm d c => constMap := constMap.insert d c
               | _ => pure ()
-          match found? with
-          | some n => pure n
-          | none => throw "LeanSVM.stackAlloc requires a compile-time constant byte size"
-        | _ => throw "LeanSVM.stackAlloc requires a compile-time constant byte size"
+          for _ in [0:4] do
+            for blk in st.blocks do
+              for s in blk.stmts do
+                match s with
+                | .mov d src =>
+                  if let some c := constMap.get? src then
+                    constMap := constMap.insert d c
+                | _ => pure ()
+              if !blk.params.isEmpty then
+                -- Check incoming edges to `blk`
+                let mut edges : Array (Array VReg) := #[]
+                for pb in st.blocks do
+                  match pb.term with
+                  | .jmp t a => if t == blk.id then edges := edges.push a
+                  | .br _ t ta e ea | .brCmp _ _ _ t ta e ea | .brCmpImm _ _ _ t ta e ea =>
+                    if t == blk.id then edges := edges.push ta
+                    if e == blk.id then edges := edges.push ea
+                  | _ => pure ()
+                if !edges.isEmpty then
+                  for k in [0:blk.params.size] do
+                    let mut common? : Option UInt64 := none
+                    let mut ok := true
+                    for e in edges do
+                      if k < e.size then
+                        match constMap.get? e[k]! with
+                        | some cv =>
+                          match common? with
+                          | none => common? := some cv
+                          | some prev => if prev != cv then ok := false
+                        | none => ok := false
+                      else ok := false
+                    if ok then
+                      if let some cv := common? then
+                        constMap := constMap.insert blk.params[k]! cv
+          match constMap.get? vr with
+          | some c => pure c.toNat
+          | none =>
+            let mut info := ""
+            for blk in st.blocks do
+              if blk.params.contains vr then
+                info := info ++ s!" paramOf(bb{blk.id},params={blk.params})"
+              for s in blk.stmts do
+                if s.defReg? == some vr then
+                  info := info ++ s!" stmt({reprStr s})"
+            throw s!"LeanSVM.stackAlloc requires a compile-time constant byte size (got reg {vr}{info} in blocks={st.blocks.size})"
+        | other => throw s!"LeanSVM.stackAlloc requires a compile-time constant byte size (got {repr other})"
     let ptrReg ← allocStack sizeNat
     return some (.ctorVal 0 #[.reg ptrReg, .erased])
 
@@ -553,8 +616,19 @@ private def isSvmStepUnitType (ty : Expr) : Bool :=
     n == ``LeanSVM.SvmStep && (isErasedType arg)
   | _, _ => false
 
-private def isSvmStepType (ty : Expr) : Bool :=
-  (peelForallTy ty).getAppFn.constName? == some ``LeanSVM.SvmStep
+private def isSvmStepScalarOrUnitType (ty : Expr) : Bool :=
+  let ret := peelForallTy ty
+  match ret.getAppFn, ret.getAppArgs with
+  | .const n _, #[arg] =>
+    n == ``LeanSVM.SvmStep && (isErasedType arg || isScalarType arg)
+  | _, _ => false
+
+private def isSvmStepScalarType (ty : Expr) : Bool :=
+  let ret := peelForallTy ty
+  match ret.getAppFn, ret.getAppArgs with
+  | .const n _, #[arg] =>
+    n == ``LeanSVM.SvmStep && isScalarType arg
+  | _, _ => false
 
 private partial def containsSvmErr (c : Code .pure) : Bool :=
   match c with
@@ -571,8 +645,8 @@ private partial def containsSvmErr (c : Code .pure) : Bool :=
   | _ => false
 
 private def shouldInlineSmallHelper (callCounts : Std.HashMap Name Nat) (n : Name) : Bool :=
-  -- Small hot SDK helpers (`nextCursor`, `pubkeyEq`, `pubkeyCopy`) inline when used <= 3 times
-  -- for maximum CU speed on tight programs, and outline when used > 3 times for tiny `.so` size!
+  -- Small hot SDK helpers (`nextCursor`, `pubkeyEq`, `pubkeyCopy`) inline when used <= 4 times
+  -- for maximum CU speed on tight programs, and outline when used > 4 times for tiny `.so` size!
   let isSmallHot :=
     n == `LeanSVM.AccountView.nextCursor ||
     n == `LeanSVM.pubkeyEq ||
@@ -613,36 +687,83 @@ private partial def countCodeCalls (env : Environment) (c : Code .pure)
         countCodeCalls env body accC accV depth
   | _ => (counts, visited)
 
-/-- Check if a `@[noinline]` helper returning `SolanaM α` (where `α` is scalar) is guaranteed
-    infallible (no `SvmStep.err`) and has 1..5 scalar params -> outline directly as `r1..r5 -> r0 = val`! -/
-private def shouldOutlineInfallibleSvmHelper (env : Environment) (d : Decl .pure) : Bool :=
-  if !Lean.Compiler.hasNoInlineAttribute env d.name then false
-  else
-    let nonErasedCount := d.params.foldl (fun c p => if isErasedType p.type then c else c + 1) 0
-    if nonErasedCount < 1 || nonErasedCount > 5 then false
-    else
-      let ret := peelForallTy d.type
-      match ret.getAppFn, ret.getAppArgs, d.value with
-      | .const n _, #[arg], .code body =>
-        n == ``LeanSVM.SvmStep && isScalarType arg && !containsSvmErr body
-      | _, _, _ => false
+private partial def codeSize (c : Code .pure) : Nat :=
+  match c with
+  | .let _ k => 1 + codeSize k
+  | .jp d k => 1 + codeSize d.value + codeSize k
+  | .fun d k _ => 1 + codeSize d.value + codeSize k
+  | .cases cs =>
+    cs.alts.foldl (init := 1) fun acc a =>
+      acc + match a with
+        | .alt _ _ body _ | .default body | .ctorAlt _ body _ => codeSize body
+  | _ => 1
 
-private def shouldOutlineScalarHelper (env : Environment) (d : Decl .pure) : Bool :=
+private partial def containsSyscall (c : Code .pure) : Bool :=
+  match c with
+  | .let d k =>
+    let hit := match d.value with
+      | .const n _ _ _ =>
+        n == ``LeanSVM.sysGetClock || n == ``LeanSVM.sysSha256 || n == ``LeanSVM.sysInvokeSignedC
+      | _ => false
+    hit || containsSyscall k
+  | .jp d k => containsSyscall d.value || containsSyscall k
+  | .fun d k _ => containsSyscall d.value || containsSyscall k
+  | .cases cs => cs.alts.any fun a =>
+    match a with
+    | .alt _ _ body _ | .default body | .ctorAlt _ body _ => containsSyscall body
+  | _ => false
+
+/-- Smart compiler-driven outlining decision:
+    Automatically outlines shared helpers (`calls >= 2 && (size >= 18 || containsSyscall)`)
+    and large handlers (`size >= 48`) into 1-CU sBPF `call` frames WITHOUT `@[noinline]`! -/
+private def shouldAutoOutline (env : Environment) (callCounts : Std.HashMap Name Nat) (d : Decl .pure) : Bool :=
   let n := d.name
-  let isMarked :=
-    Lean.Compiler.hasNoInlineAttribute env n ||
-    n.toString.endsWith "div128Loop" ||
-    n.toString.endsWith "isqrt64"
-  if !isMarked then false
+  let ns := n.toString
+  if shouldInlineSmallHelper callCounts n then false
+  else if ns.startsWith "UInt" || ns.startsWith "Bool." || ns.startsWith "Nat." ||
+          ns.startsWith "Decidable." || ns.startsWith "LeanSVM.raw" || ns.startsWith "LeanSVM.sys" ||
+          ns.startsWith "LeanSVM.load" || ns.startsWith "LeanSVM.store" ||
+          ns.startsWith "LeanSVM.checked" || ns.startsWith "LeanSVM.SolanaM." ||
+          ns.startsWith "LeanSVM.stackAlloc" || ns.startsWith "LeanSVM.Input.parse" ||
+          (ns.startsWith "LeanSVM.AccountView." && n != `LeanSVM.AccountView.nextCursor) then
+    false
+  else if Lean.Compiler.hasNoInlineAttribute env n ||
+          ns.endsWith "div128Loop" || ns.endsWith "isqrt64" then
+    true
   else
-    let nonErasedCount := d.params.foldl (fun c p => if isErasedType p.type then c else c + 1) 0
-    nonErasedCount >= 1 && nonErasedCount <= 5 && isScalarType d.type
+    match d.value with
+    | .code body =>
+      let sz := codeSize body
+      let cnt := callCounts.getD n 0
+      (cnt >= 5 && sz >= 7) || (cnt >= 2 && (sz >= 16 || containsSyscall body)) || sz >= 44
+    | .extern _ => false
 
-private def shouldOutlineSvmUnitHelper (env : Environment) (d : Decl .pure) : Bool :=
-  if !Lean.Compiler.hasNoInlineAttribute env d.name then false
+private def nonErasedParamCount (d : Decl .pure) : Nat :=
+  d.params.foldl (fun c p => if isErasedType p.type then c else c + 1) 0
+
+private def isInfallibleSvmHelper (d : Decl .pure) : Bool :=
+  let cnt := nonErasedParamCount d
+  if cnt > 5 then false
   else
-    let nonErasedCount := d.params.foldl (fun c p => if isErasedType p.type then c else c + 1) 0
-    nonErasedCount >= 1 && nonErasedCount <= 5 && isSvmStepUnitType d.type
+    match d.value with
+    | .code body => isSvmStepScalarType d.type && !containsSvmErr body
+    | _ => false
+
+private def isFallibleSvmHelper (d : Decl .pure) : Bool :=
+  let cnt := nonErasedParamCount d
+  if cnt > 4 then false
+  else
+    match d.value with
+    | .code body => isSvmStepScalarType d.type && containsSvmErr body
+    | _ => false
+
+private def isScalarHelper (d : Decl .pure) : Bool :=
+  let cnt := nonErasedParamCount d
+  cnt >= 1 && cnt <= 5 && isScalarType d.type
+
+private def isSvmUnitHelper (d : Decl .pure) : Bool :=
+  let cnt := nonErasedParamCount d
+  cnt <= 5 && isSvmStepUnitType d.type
 
 /-- Lower LCNF `Code .pure` into `SbfIR` blocks.
     `onReturn` handles `.return fvar` (either exiting the entrypoint or jumping to an inlined caller's continuation). -/
@@ -745,9 +866,12 @@ partial def lowerCode
                 match calleeDecl.value with
                 | .code calleeBody =>
                   let cc := (← get).callCounts
-                  if !shouldInlineSmallHelper cc declName && (shouldOutlineScalarHelper env calleeDecl || shouldOutlineSvmUnitHelper env calleeDecl || shouldOutlineInfallibleSvmHelper env calleeDecl) then
-                    let isSvmUnit := shouldOutlineSvmUnitHelper env calleeDecl
-                    let isInfallibleSvm := shouldOutlineInfallibleSvmHelper env calleeDecl
+                  let autoOut := shouldAutoOutline env cc calleeDecl
+                  let isSvmUnit := isSvmUnitHelper calleeDecl
+                  let isInfallibleSvm := isInfallibleSvmHelper calleeDecl
+                  let isFallibleSvm := isFallibleSvmHelper calleeDecl
+                  let isScalar := isScalarHelper calleeDecl
+                  if autoOut && (isScalar || isSvmUnit || isInfallibleSvm || isFallibleSvm) then
                     let fnLabel ← match (← get).outlinedNames.get? declName with
                       | some lbl => pure lbl
                       | none =>
@@ -762,8 +886,12 @@ partial def lowerCode
                         let savedCurBlk := (← get).curBlock
                         let savedNextVReg := (← get).nextVReg
                         let savedStack := (← get).stackAllocBytes
+                        let savedRetSlot := (← get).callRetSlotOff?
                         let savedLoops := (← get).activeRecLoops
-                        modify fun st => { st with blocks := #[], curBlock := 0, nextVReg := 0, stackAllocBytes := 0, activeRecLoops := [] }
+                        modify fun st => { st with
+                          blocks := #[], curBlock := 0, nextVReg := 0,
+                          stackAllocBytes := 0, callRetSlotOff? := none, activeRecLoops := []
+                        }
                         let hEntryBlk ← newBlock #[]
                         switchBlock hEntryBlk
                         let mut hParams : Array VReg := #[]
@@ -778,11 +906,42 @@ partial def lowerCode
                             hParams := hParams.push pr
                             hKinds := hKinds.push true
                             hEnv := hEnv.insert p.fvarId (.reg pr)
+                        -- For fallible `SolanaM α` helpers, append hidden `outPtr` parameter (`r_{k+1}`)!
+                        let outPtrReg? ← if isFallibleSvm then
+                            let op ← freshVReg
+                            hParams := hParams.push op
+                            pure (some op)
+                          else pure none
                         let helperRet : Val → LowerM Unit :=
                           if isSvmUnit then lowerEntryReturn
                           else if isInfallibleSvm then fun rv => do
                             let r ← extractLoopVal rv
                             setTerm (.ret r)
+                          else if let some outPtrReg := outPtrReg? then fun rv => do
+                            match rv with
+                            | .ctorVal 0 fields =>
+                              let vr ← valToReg (fields.getD 0 .erased)
+                              emit (.store .b8 outPtrReg 0 vr)
+                              let z ← emitConst 0
+                              setTerm (.ret z)
+                            | .ctorVal 1 fields =>
+                              let er ← valToReg (fields.getD 0 .erased)
+                              setTerm (.ret er)
+                            | .dynCtor tag payloads =>
+                              let okB ← newBlock
+                              let errB ← newBlock
+                              setTerm (.brCmpImm .eq tag 0 okB #[] errB #[])
+                              switchBlock okB
+                              emit (.store .b8 outPtrReg 0 (payloads.getD 0 tag))
+                              let z ← emitConst 0
+                              setTerm (.ret z)
+                              switchBlock errB
+                              setTerm (.ret (payloads.getD 0 tag))
+                            | other =>
+                              let vr ← valToReg other
+                              emit (.store .b8 outPtrReg 0 vr)
+                              let z ← emitConst 0
+                              setTerm (.ret z)
                           else fun rv => do let r ← valToReg rv; setTerm (.ret r)
                         if containsConst calleeBody declName then
                           let mut loopParams : Array VReg := #[]
@@ -795,7 +954,8 @@ partial def lowerCode
                               loopParams := loopParams.push lr
                               loopEnv := loopEnv.insert p.fvarId (.reg lr)
                           let lBlk ← newBlock loopParams
-                          setTerm (.jmp lBlk hParams)
+                          let initLoopArgs := if isFallibleSvm then hParams.pop else hParams
+                          setTerm (.jmp lBlk initLoopArgs)
                           switchBlock lBlk
                           modify fun st => { st with activeRecLoops := [(declName, lBlk, loopParams, hKinds)] }
                           lowerCode calleeBody loopEnv {} helperRet (fuel - 1)
@@ -816,6 +976,7 @@ partial def lowerCode
                           curBlock := savedCurBlk
                           nextVReg := savedNextVReg
                           stackAllocBytes := savedStack
+                          callRetSlotOff? := savedRetSlot
                           activeRecLoops := savedLoops
                           outlinedHelpers := st.outlinedHelpers.push helperFunc
                         }
@@ -825,10 +986,26 @@ partial def lowerCode
                       if !isErasedType calleeDecl.params[idx]!.type then
                         callArgs := callArgs.push (← valToReg (argVals.getD idx .erased))
                     if isSvmUnit && !containsSvmErr calleeBody then
-                      -- Infallible `SolanaM Unit` helper (e.g. `writeAccountInfo`, `pubkeyCopy`):
-                      -- 1-instruction `call`, ZERO error check, ZERO extra basic blocks!
+                      -- Infallible `SolanaM Unit` helper: 1-instruction `call`, ZERO error check!
                       emit (.call none fnLabel callArgs)
                       pure (.ctorVal 0 #[.erased, .erased])
+                    else if isFallibleSvm then
+                      -- Fallible `SolanaM α` helper: pass shared 8-byte out-slot, check `r0 == 0`, load result!
+                      let (outPtrReg, outSlotOff) ← getOrAllocCallRetSlot
+                      let resReg ← freshVReg
+                      emit (.call (some resReg) fnLabel (callArgs.push outPtrReg))
+                      let okBlk ← newBlock #[]
+                      let errBlk ← newBlock #[]
+                      setTerm (.brCmpImm .eq resReg 0 okBlk #[] errBlk #[])
+                      switchBlock errBlk
+                      let envErr := envMap.insert decl.fvarId (.ctorVal 1 #[.reg resReg, .erased])
+                      lowerCode k envErr jpMap onReturn fuel
+                      switchBlock okBlk
+                      let valReg ← freshVReg
+                      emit (.loadStack .b8 valReg outSlotOff)
+                      let envOk := envMap.insert decl.fvarId (.ctorVal 0 #[.reg valReg, .erased])
+                      lowerCode k envOk jpMap onReturn fuel
+                      return ()
                     else
                     let resReg ← freshVReg
                     emit (.call (some resReg) fnLabel callArgs)
@@ -941,7 +1118,7 @@ partial def lowerCode
                     if isTailRet then
                       lowerCode calleeBody calleeEnv {} onReturn (fuel - 1)
                       return ()
-                    else if isSvmStepType calleeDecl.type then
+                    else if isSvmStepScalarOrUnitType calleeDecl.type then
                       -- Join all return paths of `calleeBody` into a single `afterBlk(tagReg, payReg)`
                       -- so continuation `k` is lowered EXACTLY ONCE (O(N) instead of O(2^N))!
                       let tagReg ← freshVReg
@@ -964,7 +1141,7 @@ partial def lowerCode
                       let envMap' := envMap.insert decl.fvarId (.dynCtor tagReg #[payReg])
                       lowerCode k envMap' jpMap onReturn fuel
                       return ()
-                    else if isScalarType calleeDecl.type then
+                    else if isScalarType calleeDecl.type && codeSize calleeBody > 4 then
                       let resReg ← freshVReg
                       let afterBlk ← newBlock #[resReg]
                       lowerCode calleeBody calleeEnv {} (fun rv => do
@@ -1005,12 +1182,13 @@ partial def lowerCode
         pKinds := pKinds.push true
         jpEnv := jpEnv.insert p.fvarId (.reg pr)
     let jpBlk ← newBlock pRegs
+    let jpMap' := jpMap.insert jpDecl.fvarId { blockId := jpBlk, paramRegs := pRegs, paramKind := pKinds }
+    -- Lower `k` first so all incoming `jmp jpBlk args` edges exist before lowering `jpDecl.value`!
+    lowerCode k envMap jpMap' onReturn (fuel - 1)
     let savedBlk := (← get).curBlock
     switchBlock jpBlk
     lowerCode jpDecl.value jpEnv jpMap onReturn (fuel - 1)
     switchBlock savedBlk
-    let jpMap' := jpMap.insert jpDecl.fvarId { blockId := jpBlk, paramRegs := pRegs, paramKind := pKinds }
-    lowerCode k envMap jpMap' onReturn (fuel - 1)
 
   | .jmp fid args =>
     match jpMap.get? fid with
@@ -1132,27 +1310,29 @@ where
       let (tag0, alt0) := explicit[0]!
       let (_, alt1) := explicit[1]!
       let savedStack := (← get).stackAllocBytes
+      let savedRetSlot := (← get).callRetSlotOff?
       let blk0 ← newBlock
       let blk1 ← newBlock
       setTerm (.brCmpImm .eq tagReg (Int32.ofInt tag0) blk0 #[] blk1 #[])
       switchBlock blk0
       lowerOne alt0
       let stack0 := (← get).stackAllocBytes
-      modify fun st => { st with stackAllocBytes := savedStack }
+      modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
       switchBlock blk1
       lowerOne alt1
       let stack1 := (← get).stackAllocBytes
-      modify fun st => { st with stackAllocBytes := max stack0 stack1 }
+      modify fun st => { st with stackAllocBytes := max stack0 stack1, callRetSlotOff? := savedRetSlot }
     else
       -- Multi-way switch chain with scoped stack reuse across mutually exclusive arms!
       let savedStack := (← get).stackAllocBytes
+      let savedRetSlot := (← get).callRetSlotOff?
       let mut maxStack := savedStack
       let mut curIdx := 0
       while curIdx < explicit.size do
         let (tagI, altI) := explicit[curIdx]!
         let isLast := curIdx + 1 == explicit.size && default?.isNone
         if isLast then
-          modify fun st => { st with stackAllocBytes := savedStack }
+          modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
           lowerOne altI
           maxStack := max maxStack (← get).stackAllocBytes
         else
@@ -1160,16 +1340,16 @@ where
           let nextBlk ← newBlock
           setTerm (.brCmpImm .eq tagReg (Int32.ofInt tagI) hitBlk #[] nextBlk #[])
           switchBlock hitBlk
-          modify fun st => { st with stackAllocBytes := savedStack }
+          modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
           lowerOne altI
           maxStack := max maxStack (← get).stackAllocBytes
           switchBlock nextBlk
         curIdx := curIdx + 1
       if let some d := default? then
-        modify fun st => { st with stackAllocBytes := savedStack }
+        modify fun st => { st with stackAllocBytes := savedStack, callRetSlotOff? := savedRetSlot }
         lowerOne d
         maxStack := max maxStack (← get).stackAllocBytes
-      modify fun st => { st with stackAllocBytes := maxStack }
+      modify fun st => { st with stackAllocBytes := maxStack, callRetSlotOff? := savedRetSlot }
 
 /-- Lower a top-level Lean 4 Solana entrypoint declaration (`input : Ptr → SolanaM Unit` or `Ptr → UInt64`)
     from its monomorphic LCNF into an unoptimized `SbfIR.Program`. -/

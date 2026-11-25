@@ -63,9 +63,10 @@ decreasing_by
     rawStoreU64 outPtr (div128Loop hi lo 0 denom 64)
 
 /-- Exact overflow-free `⌊(a * b) / denom⌋` using full 128-bit intermediate precision!
-    - Fast path (`(a ||| b) <= 0xFFFFFFFF`): single `mul64` + `div64` inline!
-    - Full 128-bit path: calls shared outlined `mulDiv128Slow` (zero code duplication!). -/
-@[inline] def mulDiv64 (a b denom : UInt64) : SolanaM UInt64 := do
+    - Fast path (`(a ||| b) <= 0xFFFFFFFF`): single `mul64` + `div64`!
+    - Full 128-bit path: calls shared `mulDiv128Slow`.
+    Automatically outlined once per binary by `lean-svm` when called multiple times! -/
+def mulDiv64 (a b denom : UInt64) : SolanaM UInt64 := do
   SolanaM.require (denom != 0) Err.arithmeticOverflow
   if a == 0 || b == 0 then
     return 0
@@ -77,7 +78,7 @@ decreasing_by
     rawLoadU64 outBuf
 
 /-- Ceiling division version `⌈(a * b) / denom⌉` (useful for protocol-favorable rounding). -/
-@[inline] def mulDiv64Ceil (a b denom : UInt64) : SolanaM UInt64 := do
+def mulDiv64Ceil (a b denom : UInt64) : SolanaM UInt64 := do
   SolanaM.require (denom != 0) Err.arithmeticOverflow
   if a == 0 || b == 0 then
     return 0

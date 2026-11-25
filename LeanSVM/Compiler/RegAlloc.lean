@@ -20,6 +20,7 @@ namespace LeanSVM.Compiler
 inductive Loc where
   | reg (r : SBPF.Reg)
   | stack (off : Int16) -- negative offset from `r10`, e.g. `-8`, `-16`, ...
+  | imm (val : UInt64)  -- rematerialized SSA constant (0 registers, 0 spills!)
   deriving Repr, BEq, Inhabited
 
 /-- Result of register allocation for a function. -/
@@ -369,18 +370,45 @@ private def runLinearScan (intervals : Array LiveInterval)
 
   return (locs, nextSpillOff, spillCount)
 
+/-- Collect all pure SSA `.constImm` definitions that can be rematerialized directly
+    at use sites (zero register pressure, zero stack spills!). -/
+private def collectRematConsts (f : Func) : Std.HashMap VReg UInt64 := Id.run do
+  let mut defCount : Std.HashMap VReg Nat := {}
+  let mut constVals : Std.HashMap VReg UInt64 := {}
+  for p in f.params do
+    defCount := defCount.insert p (defCount.getD p 0 + 1)
+  for blk in f.blocks do
+    for bp in blk.params do
+      defCount := defCount.insert bp (defCount.getD bp 0 + 1)
+    for s in blk.stmts do
+      if let some d := s.defReg? then
+        defCount := defCount.insert d (defCount.getD d 0 + 1)
+      match s with
+      | .constImm d v => constVals := constVals.insert d v
+      | _ => pure ()
+  let mut remat : Std.HashMap VReg UInt64 := {}
+  for (v, val) in constVals.toList do
+    if defCount.getD v 0 == 1 then
+      remat := remat.insert v val
+  return remat
+
 /-- Allocate physical sBPF registers (and minimal stack spill slots only if required) for `f`. -/
 def allocateRegisters (f : Func) : AllocResult :=
   let ordered := orderBlocksRPO f
-  let intervals := computeIntervals f ordered
+  let rematConsts := collectRematConsts f
+  let allIntervals := computeIntervals f ordered
+  -- Exclude rematerialized constants from register/spill allocation!
+  let intervals := allIntervals.filter (fun iv => !rematConsts.contains iv.vreg)
+  let addImmLocs (m : Std.HashMap VReg Loc) : Std.HashMap VReg Loc :=
+    rematConsts.fold (init := m) fun acc v val => acc.insert v (.imm val)
   let callee := #[SBPF.Reg.r6, SBPF.Reg.r7, SBPF.Reg.r8, SBPF.Reg.r9]
   let callerFull := #[SBPF.Reg.r1, SBPF.Reg.r2, SBPF.Reg.r3, SBPF.Reg.r4, SBPF.Reg.r5]
   let (locs1, stack1, spills1) := runLinearScan intervals callerFull callee f.stackAllocBytes
   if spills1 == 0 then
-    { locs := locs1, orderedBlocks := ordered, totalStackBytes := stack1, spillCount := 0, usesScratch := false }
+    { locs := addImmLocs locs1, orderedBlocks := ordered, totalStackBytes := stack1, spillCount := 0, usesScratch := false }
   else
     let callerSpill := #[SBPF.Reg.r1, SBPF.Reg.r2, SBPF.Reg.r3, SBPF.Reg.r4]
     let (locs2, stack2, spills2) := runLinearScan intervals callerSpill callee f.stackAllocBytes
-    { locs := locs2, orderedBlocks := ordered, totalStackBytes := stack2, spillCount := spills2, usesScratch := true }
+    { locs := addImmLocs locs2, orderedBlocks := ordered, totalStackBytes := stack2, spillCount := spills2, usesScratch := true }
 
 end LeanSVM.Compiler

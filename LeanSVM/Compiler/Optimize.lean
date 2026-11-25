@@ -28,6 +28,9 @@ private def log2IfPow2 (v : UInt64) : Option Nat :=
       | n + 1 => if x <= 1 then k else go (x >>> 1) (k + 1) n
     some (go v 0 64)
 
+private def memSizeTag : SBPF.MemSize → Nat
+  | .b1 => 0 | .b2 => 1 | .b4 => 2 | .b8 => 3
+
 private def fitsInt16 (x : Int) : Option Int16 :=
   if x >= -32768 && x <= 32767 then some (Int16.ofInt x) else none
 
@@ -120,6 +123,9 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
     let mut outStmts : Array Stmt := Array.emptyWithCapacity blk.stmts.size
     -- Local CSE table within the current basic block: `(opTag, lhs, rhsOrImm) -> vreg`
     let mut localBinImmCse : Std.HashMap (Nat × VReg × Int) VReg := {}
+    -- Local load-CSE & store-to-load forwarding (conservatively invalidated on stores/calls/syscalls)
+    let mut localLoads      : Std.HashMap (VReg × Int × Nat) VReg := {}
+    let mut localStackLoads : Std.HashMap (Int × Nat) VReg := {}
     for rawStmt in blk.stmts do
       let s0 := substStmt aliases rawStmt
       if s0 != rawStmt then changed := true
@@ -297,6 +303,36 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
           if let some combined := fitsInt16 (k + off.toInt) then
             changed := true
             s1 := .load sz d base0 combined
+        -- Local load-CSE after address/stack folding!
+        match s1 with
+        | .load lsz ld lbase loff =>
+          let key := (lbase, loff.toInt, memSizeTag lsz)
+          match localLoads.get? key with
+          | some prev =>
+            changed := true
+            aliases := aliases.insert ld prev
+            s1 := .mov ld prev
+          | none =>
+            localLoads := localLoads.insert key ld
+        | .loadStack lsz ld loff =>
+          let key := (loff.toInt, memSizeTag lsz)
+          match localStackLoads.get? key with
+          | some prev =>
+            changed := true
+            aliases := aliases.insert ld prev
+            s1 := .mov ld prev
+          | none =>
+            localStackLoads := localStackLoads.insert key ld
+        | _ => pure ()
+      | .loadStack sz d off =>
+        let key := (off.toInt, memSizeTag sz)
+        match localStackLoads.get? key with
+        | some prev =>
+          changed := true
+          aliases := aliases.insert d prev
+          s1 := .mov d prev
+        | none =>
+          localStackLoads := localStackLoads.insert key d
       | .store sz base off val =>
         -- Fold stack base, register offset, AND immediate value into 1-insn `storeStackImm` / `storeImm`!
         let valImm? : Option Int32 :=
@@ -318,6 +354,21 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
         else if let some i32 := valImm? then
           changed := true
           s1 := .storeImm sz base off i32
+        -- Update load-CSE / store-to-load forwarding tables safely
+        match s1 with
+        | .store ssz sbase soff sval =>
+          localLoads := {}
+          localLoads := localLoads.insert (sbase, soff.toInt, memSizeTag ssz) sval
+        | .storeImm _ _ _ _ =>
+          localLoads := {}
+        | .storeStack ssz soff sval =>
+          localStackLoads := {}
+          localStackLoads := localStackLoads.insert (soff.toInt, memSizeTag ssz) sval
+        | .storeStackImm _ _ _ =>
+          localStackLoads := {}
+        | _ =>
+          localLoads := {}
+          localStackLoads := {}
       | .storeImm sz base off imm =>
         if let some so := stackOffs.get? base then
           if let some combined := fitsInt16 (so + off.toInt) then
@@ -327,11 +378,24 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
           if let some combined := fitsInt16 (k + off.toInt) then
             changed := true
             s1 := .storeImm sz base0 combined imm
+        match s1 with
+        | .storeStackImm _ _ _ => localStackLoads := {}
+        | _ => localLoads := {}
       | .storeStack sz off val =>
         if let some cv := consts.get? val then
           if let some i32 := fitsInt32U64 cv then
             changed := true
             s1 := .storeStackImm sz off i32
+        localStackLoads := {}
+        match s1 with
+        | .storeStack ssz soff sval =>
+          localStackLoads := localStackLoads.insert (soff.toInt, memSizeTag ssz) sval
+        | _ => pure ()
+      | .storeStackImm _ _ _ =>
+        localStackLoads := {}
+      | .call _ _ _ | .syscall _ _ _ =>
+        localLoads := {}
+        localStackLoads := {}
       | _ => pure ()
       outStmts := outStmts.push s1
 
@@ -564,6 +628,102 @@ private def cfgCleanupPass (f : Func) : Func × Bool := Id.run do
   if kept.size != rewritten.size then changed := true
   return ({ f with blocks := kept }, changed)
 
+/-- Balanced Binary-Search Switch Dispatch Pass:
+    Detects linear `if disc == c0 then t0 else if disc == c1 then t1 ...` dispatch chains
+    with `>= 6` distinct unsigned constant cases on the same discriminant `disc` and
+    rewrites them into a balanced O(log2 N) binary search tree (`brCmpImm .ult`)! -/
+private def switchDispatchPass (f : Func) : Func × Bool := Id.run do
+  let mut blkMap : Std.HashMap BlockId Block := {}
+  let mut maxBid : BlockId := 0
+  for b in f.blocks do
+    blkMap := blkMap.insert b.id b
+    if b.id > maxBid then maxBid := b.id
+
+  -- Count incoming predecessors for each block so we only rewrite internal chain blocks with 1 pred
+  let mut predCount : Std.HashMap BlockId Nat := {}
+  for b in f.blocks do
+    for s in b.term.succs do
+      predCount := predCount.insert s (predCount.getD s 0 + 1)
+
+  let mut rewritten := false
+  let mut updatedMap := blkMap
+  let mut nextBid := maxBid + 1
+  let mut extraBlocks : Array Block := #[]
+
+  for blk in f.blocks do
+    match (updatedMap.getD blk.id blk).term with
+    | .brCmpImm .eq disc c0 t0 #[] e0 #[] =>
+      if c0.toInt >= 0 then
+        -- Follow linear equality chain on `disc`
+        let mut cases : Array (Int32 × BlockId) := #[(c0, t0)]
+        let mut seenKeys : Std.HashSet Int := ({} : Std.HashSet Int).insert c0.toInt
+        let mut curId := e0
+        let mut defaultBlk := e0
+        let mut chainIds : Array BlockId := #[]
+        for _ in [0:64] do
+          if predCount.getD curId 0 != 1 then break
+          match updatedMap.get? curId with
+          | some nb =>
+            if nb.params.isEmpty && nb.stmts.isEmpty then
+              match nb.term with
+              | .brCmpImm .eq disc2 ck tk #[] ek #[] =>
+                if disc2 == disc && ck.toInt >= 0 && !seenKeys.contains ck.toInt then
+                  cases := cases.push (ck, tk)
+                  seenKeys := seenKeys.insert ck.toInt
+                  chainIds := chainIds.push curId
+                  curId := ek
+                  defaultBlk := ek
+                else break
+              | _ => break
+            else break
+          | none => break
+        if cases.size >= 6 then
+          -- Sort cases by unsigned/non-negative key ascending
+          let sorted := cases.qsort (fun a b => a.1.toInt < b.1.toInt)
+          -- Build balanced binary search tree recursively using iterative/fuel helper
+          let rec buildTree (lo hi : Nat) (fuel : Nat)
+              (nb : BlockId) (ex : Array Block) : Term × BlockId × Array Block :=
+            match fuel with
+            | 0 => (.jmp defaultBlk #[], nb, ex)
+            | fuel' + 1 =>
+              let len := hi - lo
+              if len == 0 then
+                (.jmp defaultBlk #[], nb, ex)
+              else if len == 1 then
+                let (ck, tk) := sorted[lo]!
+                (.brCmpImm .eq disc ck tk #[] defaultBlk #[], nb, ex)
+              else if len == 2 then
+                let (cA, tA) := sorted[lo]!
+                let (cB, tB) := sorted[lo + 1]!
+                let bId := nb
+                let bBlk : Block := { id := bId, params := #[], stmts := #[],
+                                      term := .brCmpImm .eq disc cB tB #[] defaultBlk #[] }
+                (.brCmpImm .eq disc cA tA #[] bId #[], nb + 1, ex.push bBlk)
+              else
+                let mid := lo + len / 2
+                let midKey := sorted[mid]!.1
+                let (lTerm, nb1, ex1) := buildTree lo mid fuel' nb ex
+                let lId := nb1
+                let lBlk : Block := { id := lId, params := #[], stmts := #[], term := lTerm }
+                let (rTerm, nb2, ex2) := buildTree mid hi fuel' (nb1 + 1) (ex1.push lBlk)
+                let rId := nb2
+                let rBlk : Block := { id := rId, params := #[], stmts := #[], term := rTerm }
+                (.brCmpImm .ult disc midKey lId #[] rId #[], nb2 + 1, ex2.push rBlk)
+          let (rootTerm, nb', ex') := buildTree 0 sorted.size 32 nextBid extraBlocks
+          nextBid := nb'
+          extraBlocks := ex'
+          let curBlk := updatedMap.getD blk.id blk
+          updatedMap := updatedMap.insert blk.id { curBlk with term := rootTerm }
+          rewritten := true
+    | _ => pure ()
+
+  if !rewritten then return (f, false)
+  let mut outBlocks : Array Block := Array.emptyWithCapacity (f.blocks.size + extraBlocks.size)
+  for b in f.blocks do
+    outBlocks := outBlocks.push (updatedMap.getD b.id b)
+  outBlocks := outBlocks ++ extraBlocks
+  return ({ f with blocks := outBlocks }, true)
+
 /-- Run all IR optimization passes to a fixed point (bounded to 12 iterations). -/
 def optimizeFunc (f : Func) : Func := Id.run do
   let mut cur := f
@@ -573,6 +733,10 @@ def optimizeFunc (f : Func) : Func := Id.run do
     let (f3, c3) := cfgCleanupPass f2
     cur := f3
     if !c1 && !c2 && !c3 then break
+  let (fSw, cSw) := switchDispatchPass cur
+  if cSw then
+    let (fClean, _) := cfgCleanupPass fSw
+    return fClean
   return cur
 
 end LeanSVM.Compiler

@@ -15,22 +15,22 @@ All Rust baselines are zero-dependency `#![no_std]` raw-pointer programs (leaner
 | Program | LeanSVM `.so` | Rust `-O3` `.so` | Size Advantage | LeanSVM CUs | Rust `-O3` CUs | Heap |
 |---|---:|---:|---:|---:|---:|---:|
 | **Noop** | **352 B** | 1,136 B | **3.23× smaller** | **2 CU** | 2 CU | 0 B |
-| **Counter** (init / inc / add) | **1,016 B** | 1,696 B | **1.67× smaller** | **25 / 30 / 32 CU** | 27 / 32 / 37 CU | 0 B |
-| **Vault** (3 accs + 32B eq + `sol_log_`) | **1,976 B** | 2,304 B | **1.17× smaller** | **168 CU** | 177 CU | 0 B |
-| **DutchAuction** (Token-2022 NFT + Clock + CPI) | **7,024 B** | 12,984 B | **1.85× smaller** | **3,090 / 4,600 CU** | 3,096 / 4,735 CU | 0 B |
+| **Counter** (init / inc / add) | **1,024 B** | 1,696 B | **1.66× smaller** | **24 / 29 / 31 CU** | 27 / 32 / 37 CU | 0 B |
+| **Vault** (3 accs + 32B eq + `sol_log_`) | **1,976 B** | 2,304 B | **1.17× smaller** | **167 CU** | 177 CU | 0 B |
+| **DutchAuction** (Token-2022 NFT + Clock + CPI) | **6,936 B** | 12,984 B | **1.87× smaller** | **3,080 / 4,581 CU** | 3,096 / 4,735 CU | 0 B |
 
 ### Full Formally Verified DeFi & NFT Protocol Suite (SPL Token + SPL Token-2022 on LiteSVM)
 
 | Program | Instructions | `.text` | Stack | Heap | `.so` Size | LiteSVM CUs | Formal Lean 4 Proofs |
 |---|---:|---:|---:|---:|---:|---|---|
 | [`Examples.Noop`](Examples/Noop.lean) | 2 | 16 B | 0 B | 0 B | **352 B** | 2 | `noop_always_succeeds` |
-| [`Examples.Counter`](Examples/Counter.lean) | 85 | 680 B | 0 B | 0 B | **1,016 B** | 25 / 30 / 32 | `counter_increment_adds_one`, `counter_increment_overflow_rejected` |
-| [`Examples.Vault`](Examples/Vault.lean) | 119 | 952 B | 0 B | 0 B | **1,976 B** | 168 | `vault_transfer_conserves_lamports`, `vault_rejects_insufficient_funds` |
-| [`Examples.HashCheck`](Examples/HashCheck.lean) | 76 | 608 B | 56 B | 0 B | **1,744 B** | 395 | `sol_sha256` + `sol_get_clock_sysvar` + `sol_log_` |
-| [`Examples.Amm`](Examples/Amm.lean) (SPL + Token-2022) | 1,358 | 10,864 B | 456 B | 0 B | **11,792 B** | init 132, addLiq 4,563, swap 4,561, remLiq 4,569 | `amm_swap_preserves_k`, `amm_swap_never_drains_reserve` |
-| [`Examples.Lending`](Examples/Lending.lean) (SPL + Token-2022) | 1,682 | 13,456 B | 392 B | 0 B | **14,512 B** | init 301, dep 1,659, bor 3,384, liq 4,862, rep 3,280 | `lending_repay_monotone`, `lending_healthy_cannot_be_liquidated` |
-| [`Examples.DutchAuction`](Examples/DutchAuction.lean) (Token-2022 NFT) | 752 | 6,016 B | 392 B | 0 B | **7,024 B** | create 3,090, buyNow 4,600 | `dutchPrice_bounded`, `dutchPrice_monotone` |
-| [`Examples.BondingCurve`](Examples/BondingCurve.lean) (Token-2022 Mint/Burn) | 918 | 7,344 B | 312 B | 0 B | **8,304 B** | init 101, buy 5,007, sell 3,741 | `curve_buy_preserves_k`, `curve_sell_bounded_by_reserve` |
+| [`Examples.Counter`](Examples/Counter.lean) | 86 | 688 B | 0 B | 0 B | **1,024 B** | 24 / 29 / 31 | `counter_increment_adds_one`, `counter_increment_overflow_rejected` |
+| [`Examples.Vault`](Examples/Vault.lean) | 119 | 952 B | 0 B | 0 B | **1,976 B** | 167 | `vault_transfer_conserves_lamports`, `vault_rejects_insufficient_funds` |
+| [`Examples.HashCheck`](Examples/HashCheck.lean) | 75 | 600 B | 56 B | 0 B | **1,736 B** | 394 | `sol_sha256` + `sol_get_clock_sysvar` + `sol_log_` |
+| [`Examples.Amm`](Examples/Amm.lean) (SPL + Token-2022) | 1,198 | 9,584 B | 384 B | 0 B | **10,512 B** | init 128, addLiq 4,540, swap 4,556, remLiq 4,572 | `amm_swap_preserves_k`, `amm_swap_never_drains_reserve` |
+| [`Examples.Lending`](Examples/Lending.lean) (SPL + Token-2022) | 1,281 | 10,248 B | 384 B | 0 B | **11,304 B** | init 297, dep 1,642, bor 3,381, liq 4,856, rep 3,257 | `lending_repay_monotone`, `lending_healthy_cannot_be_liquidated` |
+| [`Examples.DutchAuction`](Examples/DutchAuction.lean) (Token-2022 NFT) | 741 | 5,928 B | 384 B | 0 B | **6,936 B** | create 3,080, buyNow 4,581 | `dutchPrice_bounded`, `dutchPrice_monotone` |
+| [`Examples.BondingCurve`](Examples/BondingCurve.lean) (Token-2022 Mint/Burn) | 847 | 6,776 B | 304 B | 0 B | **7,736 B** | init 99, buy 5,018, sell 3,757 | `curve_buy_preserves_k`, `curve_sell_bounded_by_reserve` |
 
 *(Note: For CPI programs, ~1,200–4,200 CUs of the transaction total come from the SPL Token / Token-2022 / System Program CPI executions themselves; LeanSVM program compute overhead is typically only ~100–400 CUs.)*
 
