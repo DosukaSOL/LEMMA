@@ -1,0 +1,14 @@
+name = "lean-svm"
+version = "0.1.0"
+defaultTargets = ["LeanSVM", "Examples", "lean-svm"]
+
+[[lean_lib]]
+name = "LeanSVM"
+
+[[lean_lib]]
+name = "Examples"
+
+[[lean_exe]]
+name = "lean-svm"
+root = "Main"
+supportInterpreter = true

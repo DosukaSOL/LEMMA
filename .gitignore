@@ -1,0 +1,10 @@
+/.lake/
+/build/
+/target/
+/svm-runner/target/
+/benchmarks/*/target/
+*.so
+*.o
+*.elf
+*.bin
+.DS_Store

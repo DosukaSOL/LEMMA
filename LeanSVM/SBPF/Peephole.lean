@@ -1,0 +1,212 @@
+/-
+  LeanSVM.SBPF.Peephole
+  Machine-level sBPF peephole optimizer: shrinks 64-bit immediates to 1-slot mov64/mov32,
+  eliminates redundant moves, no-op ALU ops, fallthrough jumps, unreachable code, and
+  folds immediate comparisons directly into conditional jump instructions.
+-/
+import LeanSVM.SBPF.ISA
+
+namespace LeanSVM.SBPF
+
+/-- Check if a `UInt64` fits in a signed 32-bit immediate (`[-2^31, 2^31 - 1]`). -/
+def fitsInt32 (v : UInt64) : Option Int32 :=
+  if v <= 0x7FFFFFFF then
+    some (Int32.ofInt (v.toNat : Int))
+  else if v >= 0xFFFFFFFF80000000 then
+    let neg := (0x10000000000000000 - v.toNat : Nat)
+    some (Int32.ofInt (-(neg : Int)))
+  else
+    none
+
+/-- Check if a `UInt64` fits in an unsigned 32-bit immediate (`[0, 2^32 - 1]`).
+    In sBPF, `mov32 dst, imm` zero-extends `imm` to 64 bits in 1 slot (saving 8 bytes over `lddw`). -/
+def fitsUInt32 (v : UInt64) : Option Int32 :=
+  if v <= 0xFFFFFFFF then
+    some (UInt32.toInt32 v.toUInt32)
+  else
+    none
+
+/-- Shrink a single instruction (e.g. `lddw` -> `mov64`/`mov32`, `mul 2^k` -> `lsh k`). -/
+def shrinkInsn : Insn → Option Insn
+  | .alu64Reg .mov d s => if d == s then none else some (.alu64Reg .mov d s)
+  | .alu32Reg .mov d s => if d == s then none else some (.alu32Reg .mov d s)
+  | .alu64Imm .add _ 0 => none
+  | .alu64Imm .sub _ 0 => none
+  | .alu64Imm .or  _ 0 => none
+  | .alu64Imm .xor _ 0 => none
+  | .alu64Imm .lsh _ 0 => none
+  | .alu64Imm .rsh _ 0 => none
+  | .alu64Imm .arsh _ 0 => none
+  | .alu64Imm .mul _ 1 => none
+  | .alu64Imm .div _ 1 => none
+  | .alu64Imm .mul d 0 => some (.alu64Imm .mov d 0)
+  | .alu64Imm .and d 0 => some (.alu64Imm .mov d 0)
+  | .lddw d imm =>
+    match fitsInt32 imm with
+    | some i32 => some (.alu64Imm .mov d i32)
+    | none =>
+      match fitsUInt32 imm with
+      | some i32 => some (.alu32Imm .mov d i32)
+      | none => some (.lddw d imm)
+  | insn => some insn
+
+/-- Single pass of peephole optimizations on a symbolic sBPF instruction stream. -/
+private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
+  let mut out : Array Insn := Array.emptyWithCapacity insns.size
+  let mut changed := false
+  let mut i := 0
+  let n := insns.size
+  let mut dead := false
+  while i < n do
+    let cur := insns[i]!
+    -- Drop unreachable instructions after `exit` or `ja` until next label
+    if dead then
+      match cur with
+      | .label _ =>
+        dead := false
+        out := out.push cur
+        i := i + 1
+        continue
+      | _ =>
+        changed := true
+        i := i + 1
+        continue
+
+    -- Single-instruction shrinking
+    match shrinkInsn cur with
+    | none =>
+      changed := true
+      i := i + 1
+      continue
+    | some shrunk =>
+      if shrunk != cur then changed := true
+      -- Three-instruction window peepholes (e.g. `mov/lddw rX, c; mov r0, rX; exit` -> `mov/lddw r0, c; exit`)
+      if i + 2 < n then
+        let nxt := insns[i + 1]!
+        let nxt2 := insns[i + 2]!
+        match shrunk, nxt, nxt2 with
+        | .alu64Imm .mov x imm, .alu64Reg .mov d x2, .exit =>
+          if d == Reg.r0 && x == x2 then
+            out := out.push (.alu64Imm .mov Reg.r0 imm) |>.push .exit
+            dead := true
+            changed := true
+            i := i + 3
+            continue
+        | .alu32Imm .mov x imm, .alu64Reg .mov d x2, .exit =>
+          if d == Reg.r0 && x == x2 then
+            out := out.push (.alu32Imm .mov Reg.r0 imm) |>.push .exit
+            dead := true
+            changed := true
+            i := i + 3
+            continue
+        | .lddw x imm, .alu64Reg .mov d x2, .exit =>
+          if d == Reg.r0 && x == x2 then
+            out := out.push (.lddw Reg.r0 imm) |>.push .exit
+            dead := true
+            changed := true
+            i := i + 3
+            continue
+        | .alu64Reg .mov x y, .alu64Reg .mov d x2, .exit =>
+          if d == Reg.r0 && x == x2 then
+            out := out.push (.alu64Reg .mov Reg.r0 y) |>.push .exit
+            dead := true
+            changed := true
+            i := i + 3
+            continue
+        | _, _, _ => pure ()
+
+      -- Two-instruction window peepholes
+      if i + 1 < n then
+        let nxt := insns[i + 1]!
+        match shrunk, nxt with
+        -- `ja L` immediately followed by `L:` -> eliminate jump!
+        | .ja tgt, .label lbl =>
+          if tgt == lbl then
+            changed := true
+            i := i + 1
+            continue
+        -- `mov64 rA, rB; mov64 rB, rA` -> drop second move
+        | .alu64Reg .mov a b, .alu64Reg .mov b2 a2 =>
+          if a == a2 && b == b2 then
+            out := out.push shrunk
+            changed := true
+            i := i + 2
+            continue
+        -- `mov64 rA, imm; mov64 rA, imm2` -> drop dead first mov
+        | .alu64Imm .mov a _, .alu64Imm .mov a2 _ =>
+          if a == a2 then
+            changed := true
+            i := i + 1
+            continue
+        -- `mov64 rA, rB; mov64 rA, imm` -> drop dead first mov
+        | .alu64Reg .mov a _, .alu64Imm .mov a2 _ =>
+          if a == a2 then
+            changed := true
+            i := i + 1
+            continue
+        -- `mov64 rA, imm; mov64 rA, rB` (when a != b) -> drop dead first mov
+        | .alu64Imm .mov a _, .alu64Reg .mov a2 b2 =>
+          if a == a2 && a != b2 then
+            changed := true
+            i := i + 1
+            continue
+        -- Store-to-reload forwarding: `stx [base+off], rA; ldx rA, [base+off]` -> drop reload!
+        | .stx sz1 b1 s1 off1, .ldx sz2 d2 b2 off2 =>
+          if sz1 == sz2 && b1 == b2 && off1 == off2 then
+            if d2 == s1 then
+              out := out.push shrunk
+              changed := true
+              i := i + 2
+              continue
+            else
+              out := out.push shrunk |>.push (.alu64Reg .mov d2 s1)
+              changed := true
+              i := i + 2
+              continue
+        -- `add64 r, k1; add64 r, k2` -> combine immediates!
+        | .alu64Imm .add r1 k1, .alu64Imm .add r2 k2 =>
+          if r1 == r2 then
+            let sum : Int := k1.toInt + k2.toInt
+            if sum >= -2147483648 && sum <= 2147483647 then
+              if sum != 0 then
+                out := out.push (.alu64Imm .add r1 (Int32.ofInt sum))
+              changed := true
+              i := i + 2
+              continue
+        | _, _ => pure ()
+
+      -- Check if `shrunk` starts a dead region
+      match shrunk with
+      | .exit | .ja _ => dead := true
+      | _ => pure ()
+      out := out.push shrunk
+      i := i + 1
+
+  -- Remove unreferenced labels (except `entrypoint` and function labels kept for clarity)
+  let mut usedLabels : List String := []
+  for insn in out do
+    match insn with
+    | .ja t | .jccReg _ _ _ t | .jccImm _ _ _ t | .callLocal t =>
+      if !usedLabels.contains t then usedLabels := t :: usedLabels
+    | _ => pure ()
+  let mut finalOut : Array Insn := Array.emptyWithCapacity out.size
+  for insn in out do
+    match insn with
+    | .label name =>
+      if name == "entrypoint" || usedLabels.contains name then
+        finalOut := finalOut.push insn
+      else
+        changed := true
+    | _ => finalOut := finalOut.push insn
+  return (finalOut, changed)
+
+/-- Run peephole optimization to a fixed point (bounded to 8 iterations). -/
+def peepholeOptimize (insns : Array Insn) : Array Insn := Id.run do
+  let mut cur := insns
+  for _ in [0:8] do
+    let (next, changed) := peepholePass cur
+    cur := next
+    if !changed then break
+  return cur
+
+end LeanSVM.SBPF

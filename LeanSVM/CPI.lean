@@ -1,0 +1,210 @@
+/-
+  LeanSVM.CPI
+  Zero-heap, stack-allocated Solana Cross-Program Invocation (`sol_invoke_signed_c`)
+  for SPL Token, SPL Token-2022, and the Solana System Program.
+
+  Exact C ABI layouts verified against Agave `solana-program-runtime 3.1.3`:
+  - `SolInstruction`  (40 bytes): `[program_id_addr, accounts_addr, accounts_len, data_addr, data_len]`
+  - `SolAccountMeta`  (16 bytes): `[pubkey_addr, is_writable:u8, is_signer:u8, pad:6]`
+  - `SolAccountInfo`  (56 bytes): `[key, lamports, data_len, data, owner, rent_epoch, is_signer, is_writable, exec, pad:5]`
+  - `SolSignerSeedC`  (16 bytes): `[addr, len]`
+  - `SolSignerSeedsC` (16 bytes): `[seeds_addr, seeds_len]`
+-/
+import LeanSVM.Types
+import LeanSVM.Runtime
+import LeanSVM.Input
+
+namespace LeanSVM.CPI
+
+/-- Write one 16-byte `SolAccountMeta` into `metaPtr`. -/
+@[inline] def writeMeta (metaPtr : Ptr) (acc : AccountView) (writable signer : UInt8) : SolanaM Unit := do
+  storeU64 metaPtr 0 (AccountView.keyPtr acc)
+  storeU8  metaPtr 8 writable
+  storeU8  metaPtr 9 signer
+
+/-- Write one 56-byte `SolAccountInfo` into `infoPtr` directly from a zero-copy `AccountView`.
+    Outlined as a 1-CU internal sBPF helper so multi-CPI DeFi programs share one tiny 13-insn copy! -/
+@[noinline] def writeAccountInfo (infoPtr : Ptr) (acc : AccountView) : SolanaM Unit := do
+  let dlen ← AccountView.dataLen acc
+  let isSig ← rawLoadU8 (acc + ABI.accIsSignerOffset)
+  let isWrt ← rawLoadU8 (acc + ABI.accIsWritableOffset)
+  let isExe ← rawLoadU8 (acc + ABI.accIsExecutableOffset)
+  storeU64 infoPtr 0  (AccountView.keyPtr acc)
+  storeU64 infoPtr 8  (acc + ABI.accLamportsOffset)
+  storeU64 infoPtr 16 dlen
+  storeU64 infoPtr 24 (AccountView.dataPtr acc)
+  storeU64 infoPtr 32 (AccountView.ownerPtr acc)
+  storeU64 infoPtr 40 0 -- rent_epoch
+  storeU8  infoPtr 48 isSig
+  storeU8  infoPtr 49 isWrt
+  storeU8  infoPtr 50 isExe
+
+/-- Write a 40-byte `SolInstruction` header into `ixPtr`. -/
+@[inline] def writeInstruction (ixPtr : Ptr) (progKeyPtr metasPtr numMetas dataPtr dataLen : UInt64) :
+    SolanaM Unit := do
+  storeU64 ixPtr 0  progKeyPtr
+  storeU64 ixPtr 8  metasPtr
+  storeU64 ixPtr 16 numMetas
+  storeU64 ixPtr 24 dataPtr
+  storeU64 ixPtr 32 dataLen
+
+/-! ### SPL Token & SPL Token-2022 CPIs (Identical ABI for both Token & Token-2022!) -/
+
+/-- Shared outlined 5-arg `TransferChecked` CPI executor (compiled ONCE per binary!).
+    `accs4Ptr` points to 4 `AccountView`s `[source, mint, dest, auth]` on caller's stack;
+    `signersPtr` is `0` for unsigned CPI or pointer to a 1-element `SolSignerSeedsC`! -/
+@[noinline] private def cpiExecTransferChecked (tokProg : AccountView) (accs4Ptr : Ptr)
+    (amount : UInt64) (decimals : UInt8) (signersPtr : Ptr) : SolanaM Unit := do
+  let source    ← loadU64 accs4Ptr 0
+  let mint      ← loadU64 accs4Ptr 8
+  let dest      ← loadU64 accs4Ptr 16
+  let authority ← loadU64 accs4Ptr 24
+  let buf ← stackAlloc 344
+  let metas := buf + 40
+  let infos := buf + 104
+  let data  := buf + 328
+  storeU8  data 0 12
+  storeU64 data 1 amount
+  storeU8  data 9 decimals
+  writeMeta metas        source    1 0
+  writeMeta (metas + 16) mint      0 0
+  writeMeta (metas + 32) dest      1 0
+  writeMeta (metas + 48) authority 0 1
+  writeAccountInfo infos         source
+  writeAccountInfo (infos + 56)  mint
+  writeAccountInfo (infos + 112) dest
+  writeAccountInfo (infos + 168) authority
+  writeInstruction buf (AccountView.keyPtr tokProg) metas 4 data 10
+  let signersLen : UInt64 := if signersPtr == 0 then 0 else 1
+  let rc ← sysInvokeSignedC buf infos 4 signersPtr signersLen
+  SolanaM.require (rc == 0) rc
+
+/-- Invoke SPL Token OR SPL Token-2022 `TransferChecked` (opcode 12) WITHOUT PDA signing.
+    Zero heap allocation; shares ONE outlined `cpiExecTransferChecked` across the whole `.so`! -/
+@[inline] def tokenTransferChecked (tokenProg source mint dest authority : AccountView)
+    (amount : UInt64) (decimals : UInt8) : SolanaM Unit := do
+  let accs4 ← stackAlloc 32
+  storeU64 accs4 0  source
+  storeU64 accs4 8  mint
+  storeU64 accs4 16 dest
+  storeU64 accs4 24 authority
+  cpiExecTransferChecked tokenProg accs4 amount decimals 0
+
+/-- Invoke SPL Token OR SPL Token-2022 `TransferChecked` (opcode 12) WITH a 3-seed PDA signer
+    `[tag(4B), keySeed(32B), bump(1B)]`! Shares ONE outlined `cpiExecTransferChecked`! -/
+@[inline] def tokenTransferCheckedSigned (tokenProg source mint dest pdaAuthority : AccountView)
+    (amount : UInt64) (decimals : UInt8)
+    (tagU32 : UInt32) (keySeedPtr : Ptr) (bump : UInt8) : SolanaM Unit := do
+  -- 32B accs4 + 8B seedBuf + 48B seedsArr + 16B signersArr = 104 bytes on caller stack!
+  let sbuf ← stackAlloc 104
+  storeU64 sbuf 0  source
+  storeU64 sbuf 8  mint
+  storeU64 sbuf 16 dest
+  storeU64 sbuf 24 pdaAuthority
+  let seedBuf    := sbuf + 32
+  let seedsArr   := sbuf + 40
+  let signersArr := sbuf + 88
+  storeU32 seedBuf 0 tagU32
+  storeU8  seedBuf 4 bump
+  storeU64 seedsArr 0  seedBuf
+  storeU64 seedsArr 8  4
+  storeU64 seedsArr 16 keySeedPtr
+  storeU64 seedsArr 24 32
+  storeU64 seedsArr 32 (seedBuf + 4)
+  storeU64 seedsArr 40 1
+  storeU64 signersArr 0 seedsArr
+  storeU64 signersArr 8 3
+  cpiExecTransferChecked tokenProg sbuf amount decimals signersArr
+
+/-- Shared outlined 5-arg `MintTo` PDA-signed CPI executor (compiled ONCE per binary!). -/
+@[noinline] private def cpiExecMintTo (tokProg : AccountView) (accs3Ptr : Ptr)
+    (amount : UInt64) (signersPtr : Ptr) : SolanaM Unit := do
+  let mint         ← loadU64 accs3Ptr 0
+  let dest         ← loadU64 accs3Ptr 8
+  let pdaAuthority ← loadU64 accs3Ptr 16
+  let buf ← stackAlloc 272
+  let metas := buf + 40
+  let infos := buf + 88
+  let data  := buf + 256
+  storeU8  data 0 7
+  storeU64 data 1 amount
+  writeMeta metas        mint         1 0
+  writeMeta (metas + 16) dest         1 0
+  writeMeta (metas + 32) pdaAuthority 0 1
+  writeAccountInfo infos         mint
+  writeAccountInfo (infos + 56)  dest
+  writeAccountInfo (infos + 112) pdaAuthority
+  writeInstruction buf (AccountView.keyPtr tokProg) metas 3 data 9
+  let rc ← sysInvokeSignedC buf infos 3 signersPtr 1
+  SolanaM.require (rc == 0) rc
+
+/-- Invoke SPL Token OR SPL Token-2022 `MintTo` (opcode 7) WITH a 3-seed PDA signer. -/
+@[inline] def tokenMintToSigned (tokenProg mint dest pdaAuthority : AccountView)
+    (amount : UInt64) (tagU32 : UInt32) (keySeedPtr : Ptr) (bump : UInt8) : SolanaM Unit := do
+  let sbuf ← stackAlloc 96
+  storeU64 sbuf 0  mint
+  storeU64 sbuf 8  dest
+  storeU64 sbuf 16 pdaAuthority
+  let seedBuf    := sbuf + 24
+  let seedsArr   := sbuf + 32
+  let signersArr := sbuf + 80
+  storeU32 seedBuf 0 tagU32
+  storeU8  seedBuf 4 bump
+  storeU64 seedsArr 0  seedBuf
+  storeU64 seedsArr 8  4
+  storeU64 seedsArr 16 keySeedPtr
+  storeU64 seedsArr 24 32
+  storeU64 seedsArr 32 (seedBuf + 4)
+  storeU64 seedsArr 40 1
+  storeU64 signersArr 0 seedsArr
+  storeU64 signersArr 8 3
+  cpiExecMintTo tokenProg sbuf amount signersArr
+
+/-- Invoke SPL Token OR SPL Token-2022 `Burn` (opcode 8) signed by transaction signer `authority`.
+    Stack layout (272 bytes total, 0 heap!). -/
+@[noinline] def tokenBurn (tokenProg account mint authority : AccountView) (amount : UInt64) :
+    SolanaM Unit := do
+  let buf ← stackAlloc 272
+  let metas := buf + 40
+  let infos := buf + 88
+  let data  := buf + 256
+  -- Instruction data: `[8, amount_le8]` (9 bytes)
+  storeU8  data 0 8
+  storeU64 data 1 amount
+  -- AccountMetas: [account(W), mint(W), authority(S)]
+  writeMeta metas        account   1 0
+  writeMeta (metas + 16) mint      1 0
+  writeMeta (metas + 32) authority 0 1
+  -- AccountInfos
+  writeAccountInfo infos         account
+  writeAccountInfo (infos + 56)  mint
+  writeAccountInfo (infos + 112) authority
+  -- SolInstruction
+  writeInstruction buf (AccountView.keyPtr tokenProg) metas 3 data 9
+  let rc ← sysInvokeSignedC buf infos 3 0 0
+  SolanaM.require (rc == 0) rc
+
+/-- Invoke Solana `SystemProgram::Transfer` (opcode 2u32) to transfer `lamports`
+    from transaction signer `fromAcc` to `toAcc`.
+    Stack layout (200 bytes total, 0 heap!). -/
+@[noinline] def systemTransfer (sysProg fromAcc toAcc : AccountView) (lamports : UInt64) :
+    SolanaM Unit := do
+  let buf ← stackAlloc 200
+  let metas := buf + 40
+  let infos := buf + 72
+  let data  := buf + 184
+  -- Instruction data: `[2u32_le, lamports_u64_le]` (12 bytes)
+  storeU32 data 0 2
+  storeU64 data 4 lamports
+  -- AccountMetas: [from(W,S), to(W)]
+  writeMeta metas        fromAcc 1 1
+  writeMeta (metas + 16) toAcc   1 0
+  -- AccountInfos
+  writeAccountInfo infos        fromAcc
+  writeAccountInfo (infos + 56) toAcc
+  -- SolInstruction
+  writeInstruction buf (AccountView.keyPtr sysProg) metas 2 data 12
+  let rc ← sysInvokeSignedC buf infos 2 0 0
+  SolanaM.require (rc == 0) rc
+
+end LeanSVM.CPI
