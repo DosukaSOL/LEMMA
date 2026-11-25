@@ -107,6 +107,18 @@ private def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (
         | .imm _, _ => acc
   return acc
 
+/-- Check whether an edge's block-parameter moves are all 0-instruction no-ops. -/
+private def isNoopEdge (alloc : AllocResult) (blkMap : Std.HashMap BlockId Block)
+    (target : BlockId) (args : Array VReg) : Bool :=
+  match blkMap.get? target with
+  | none => true
+  | some tgtBlk => Id.run do
+    let n := min tgtBlk.params.size args.size
+    for i in [0:n] do
+      if getLoc alloc tgtBlk.params[i]! != getLoc alloc args[i]! then
+        return false
+    return true
+
 /-- Emit block-parameter edge moves from `args` into `targetBlock.params`. -/
 private def emitEdgeMoves (alloc : AllocResult) (blkMap : Std.HashMap BlockId Block)
     (target : BlockId) (args : Array VReg) (out : Array Insn) : Array Insn :=
@@ -325,7 +337,9 @@ def generateFuncCode (f : Func) : Array Insn × AllocResult := Id.run do
         out := out.push (.ja (blkLabel f tgt))
     | .br cond tBlk tArgs eBlk eArgs =>
       let (cr, o1) := loadVReg alloc cond Reg.r0 out
-      if tArgs.isEmpty && eArgs.isEmpty then
+      let tNoop := isNoopEdge alloc blkMap tBlk tArgs
+      let eNoop := isNoopEdge alloc blkMap eBlk eArgs
+      if tNoop && eNoop then
         if nextBlkId? == some tBlk then
           out := o1.push (.jccImm .eq cr 0 (blkLabel f eBlk))
         else if nextBlkId? == some eBlk then
@@ -345,19 +359,21 @@ def generateFuncCode (f : Func) : Array Insn × AllocResult := Id.run do
     | .brCmp op l r tBlk tArgs eBlk eArgs =>
       let (lr, o1) := loadVReg alloc l Reg.r0 out
       let (rr, o2) := loadVReg alloc r Reg.r5 o1
-      if tArgs.isEmpty && eArgs.isEmpty then
+      let tNoop := isNoopEdge alloc blkMap tBlk tArgs
+      let eNoop := isNoopEdge alloc blkMap eBlk eArgs
+      if tNoop && eNoop then
         if nextBlkId? == some tBlk then
           out := o2.push (.jccReg op.invert.toJmpCond lr rr (blkLabel f eBlk))
         else if nextBlkId? == some eBlk then
           out := o2.push (.jccReg op.toJmpCond lr rr (blkLabel f tBlk))
         else
           out := o2.push (.jccReg op.toJmpCond lr rr (blkLabel f tBlk)) |>.push (.ja (blkLabel f eBlk))
-      else if tArgs.isEmpty && nextBlkId? != some tBlk then
+      else if tNoop && nextBlkId? != some tBlk then
         out := o2.push (.jccReg op.toJmpCond lr rr (blkLabel f tBlk))
         out := emitEdgeMoves alloc blkMap eBlk eArgs out
         if nextBlkId? != some eBlk then
           out := out.push (.ja (blkLabel f eBlk))
-      else if eArgs.isEmpty && nextBlkId? != some eBlk then
+      else if eNoop && nextBlkId? != some eBlk then
         out := o2.push (.jccReg op.invert.toJmpCond lr rr (blkLabel f eBlk))
         out := emitEdgeMoves alloc blkMap tBlk tArgs out
         if nextBlkId? != some tBlk then
@@ -374,19 +390,21 @@ def generateFuncCode (f : Func) : Array Insn × AllocResult := Id.run do
           out := out.push (.ja (blkLabel f eBlk))
     | .brCmpImm op l imm tBlk tArgs eBlk eArgs =>
       let (lr, o1) := loadVReg alloc l Reg.r0 out
-      if tArgs.isEmpty && eArgs.isEmpty then
+      let tNoop := isNoopEdge alloc blkMap tBlk tArgs
+      let eNoop := isNoopEdge alloc blkMap eBlk eArgs
+      if tNoop && eNoop then
         if nextBlkId? == some tBlk then
           out := o1.push (.jccImm op.invert.toJmpCond lr imm (blkLabel f eBlk))
         else if nextBlkId? == some eBlk then
           out := o1.push (.jccImm op.toJmpCond lr imm (blkLabel f tBlk))
         else
           out := o1.push (.jccImm op.toJmpCond lr imm (blkLabel f tBlk)) |>.push (.ja (blkLabel f eBlk))
-      else if tArgs.isEmpty && nextBlkId? != some tBlk then
+      else if tNoop && nextBlkId? != some tBlk then
         out := o1.push (.jccImm op.toJmpCond lr imm (blkLabel f tBlk))
         out := emitEdgeMoves alloc blkMap eBlk eArgs out
         if nextBlkId? != some eBlk then
           out := out.push (.ja (blkLabel f eBlk))
-      else if eArgs.isEmpty && nextBlkId? != some eBlk then
+      else if eNoop && nextBlkId? != some eBlk then
         out := o1.push (.jccImm op.invert.toJmpCond lr imm (blkLabel f eBlk))
         out := emitEdgeMoves alloc blkMap tBlk tArgs out
         if nextBlkId? != some tBlk then

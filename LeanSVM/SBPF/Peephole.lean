@@ -244,13 +244,117 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
     | _ => finalOut := finalOut.push insn
   return (finalOut, changed)
 
+/-- Basic-block register value tracking pass:
+    Eliminates redundant constant rematerializations (`mov64/mov32/lddw` of a value
+    already in `dst`) and redundant stack-spill reloads (`ldxdw dst, [r10+off]` when
+    `dst` already holds `[r10+off]`) within each straight-line basic block! -/
+private def bbValueTrackPass (insns : Array Insn) : Array Insn × Bool := Id.run do
+  let mut out : Array Insn := Array.emptyWithCapacity insns.size
+  let mut changed := false
+  let mut regConst : Array (Option UInt64) := Array.replicate 11 none
+  let mut regStack : Array (Option Int16)  := Array.replicate 11 none
+
+  let resetAll := (Array.replicate 11 (none : Option UInt64), Array.replicate 11 (none : Option Int16))
+  let clearSlot (rs : Array (Option Int16)) (off : Int16) : Array (Option Int16) :=
+    rs.map (fun o => if o == some off then none else o)
+  let immVal32 (i : Int32) : UInt64 := Int64.toUInt64 (Int64.ofInt i.toInt)
+  let uimmVal32 (i : Int32) : UInt64 := (Int32.toUInt32 i).toUInt64
+
+  for insn in insns do
+    match insn with
+    | .label _ =>
+      let (rc, rs) := resetAll
+      regConst := rc; regStack := rs
+      out := out.push insn
+    | .callLocal _ | .callSyscall _ =>
+      -- Caller-saved r0..r5 clobbered; conservatively clear all stack slot tracking
+      -- (callee may write via stack out-pointer), preserve `regConst` on callee-saved r6..r9!
+      for idx in [0:6] do
+        regConst := regConst.set! idx none
+      regStack := Array.replicate 11 none
+      out := out.push insn
+    | .exit | .ja _ =>
+      let (rc, rs) := resetAll
+      regConst := rc; regStack := rs
+      out := out.push insn
+    | .alu64Imm .mov d imm =>
+      let v := immVal32 imm
+      let di := d.idx.toNat
+      if regConst[di]! == some v then
+        changed := true
+      else
+        regConst := regConst.set! di (some v)
+        regStack := regStack.set! di none
+        out := out.push insn
+    | .alu32Imm .mov d imm =>
+      let v := uimmVal32 imm
+      let di := d.idx.toNat
+      if regConst[di]! == some v then
+        changed := true
+      else
+        regConst := regConst.set! di (some v)
+        regStack := regStack.set! di none
+        out := out.push insn
+    | .lddw d v =>
+      let di := d.idx.toNat
+      if regConst[di]! == some v then
+        changed := true
+      else
+        regConst := regConst.set! di (some v)
+        regStack := regStack.set! di none
+        out := out.push insn
+    | .alu64Reg .mov d s =>
+      let di := d.idx.toNat
+      let si := s.idx.toNat
+      if d == s || (regConst[di]!.isSome && regConst[di]! == regConst[si]!) ||
+         (regStack[di]!.isSome && regStack[di]! == regStack[si]!) then
+        changed := true
+      else
+        regConst := regConst.set! di regConst[si]!
+        regStack := regStack.set! di regStack[si]!
+        out := out.push insn
+    | .ldx .b8 d base off =>
+      let di := d.idx.toNat
+      if base == Reg.r10 && regStack[di]! == some off then
+        changed := true
+      else
+        regConst := regConst.set! di none
+        regStack := regStack.set! di (if base == Reg.r10 then some off else none)
+        out := out.push insn
+    | .stx .b8 base s off =>
+      let si := s.idx.toNat
+      if base == Reg.r10 && regStack[si]! == some off then
+        changed := true
+      else
+        if base == Reg.r10 then
+          regStack := clearSlot regStack off
+          regStack := regStack.set! si (some off)
+        else
+          -- Indirect store could alias a stack buffer pointer (e.g. outBuf)
+          regStack := Array.replicate 11 none
+        out := out.push insn
+    | .stx _ base _ _ | .stImm _ base _ _ =>
+      let _ := base
+      regStack := Array.replicate 11 none
+      out := out.push insn
+    | .ldx _ d _ _ | .alu64Reg _ d _ | .alu64Imm _ d _ | .alu32Reg _ d _
+    | .alu32Imm _ d _ | .neg64 d | .lddwRodata d _ =>
+      let di := d.idx.toNat
+      regConst := regConst.set! di none
+      regStack := regStack.set! di none
+      out := out.push insn
+    | .jccReg _ _ _ _ | .jccImm _ _ _ _ =>
+      out := out.push insn
+  return (out, changed)
+
 /-- Run peephole optimization to a fixed point (bounded to 8 iterations). -/
 def peepholeOptimize (insns : Array Insn) : Array Insn := Id.run do
   let mut cur := insns
   for _ in [0:8] do
-    let (next, changed) := peepholePass cur
-    cur := next
-    if !changed then break
+    let (next1, c1) := peepholePass cur
+    let (next2, c2) := bbValueTrackPass next1
+    cur := next2
+    if !c1 && !c2 then break
   return cur
 
 end LeanSVM.SBPF

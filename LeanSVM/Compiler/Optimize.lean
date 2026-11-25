@@ -576,6 +576,22 @@ private def cfgCleanupPass (f : Func) : Func × Bool := Id.run do
             constExitCanon := constExitCanon.insert cv blk.id
       | _, _ => pure ()
 
+  -- 3. Tail-merge empty variable-return exit blocks `bbK(): ret v` into ONE shared `ret(p)` block!
+  --    Eliminates long live ranges & hot-path stack spills on every fallible helper call's `rc`!
+  let mut varRetMap : Std.HashMap BlockId VReg := {}
+  let mut existingSharedRet? : Option BlockId := none
+  let mut maxBid : BlockId := 0
+  for blk in f.blocks do
+    if blk.id > maxBid then maxBid := blk.id
+    if blk.id != 0 && blk.stmts.isEmpty then
+      match blk.term with
+      | .ret rv =>
+        if blk.params.isEmpty then
+          varRetMap := varRetMap.insert blk.id rv
+        else if blk.params.size == 1 && blk.params[0]! == rv then
+          existingSharedRet? := some blk.id
+      | _ => pure ()
+
   let resolveBlk (b : BlockId) : BlockId := Id.run do
     let mut cur := b
     for _ in [0:16] do
@@ -584,29 +600,56 @@ private def cfgCleanupPass (f : Func) : Func × Bool := Id.run do
       | none => break
     return cur
 
+  let mut nextVReg := f.nextVReg
+  let mut extraSharedRet? : Option Block := none
+  let mut sharedRetId? : Option BlockId := none
+  if !varRetMap.isEmpty then
+    match existingSharedRet? with
+    | some sid => sharedRetId? := some sid
+    | none =>
+      let sid := maxBid + 1
+      let retP := nextVReg
+      nextVReg := nextVReg + 1
+      extraSharedRet? := some { id := sid, params := #[retP], stmts := #[], term := .ret retP }
+      sharedRetId? := some sid
+
+  let rewriteEdge (t : BlockId) (a : Array VReg) : BlockId × Array VReg × Bool :=
+    let t1 := resolveBlk t
+    match sharedRetId?, varRetMap.get? t1 with
+    | some sid, some rv =>
+      if a.isEmpty then (sid, #[rv], true)
+      else (t1, a, t1 != t)
+    | _, _ => (t1, a, t1 != t)
+
   let mut changed := false
-  let mut rewritten : Array Block := Array.emptyWithCapacity f.blocks.size
+  let mut rewritten : Array Block := Array.emptyWithCapacity (f.blocks.size + 1)
   for blk in f.blocks do
     let mut t' := blk.term
     match blk.term with
     | .jmp t a =>
-      let t2 := resolveBlk t
-      if t2 != t then changed := true
-      t' := .jmp t2 a
+      let (t2, a2, c) := rewriteEdge t a
+      if c then changed := true
+      t' := .jmp t2 a2
     | .br c t ta e ea =>
-      let t2 := resolveBlk t; let e2 := resolveBlk e
-      if t2 != t || e2 != e then changed := true
-      t' := .br c t2 ta e2 ea
+      let (t2, ta2, c1) := rewriteEdge t ta
+      let (e2, ea2, c2) := rewriteEdge e ea
+      if c1 || c2 then changed := true
+      t' := .br c t2 ta2 e2 ea2
     | .brCmp op l r t ta e ea =>
-      let t2 := resolveBlk t; let e2 := resolveBlk e
-      if t2 != t || e2 != e then changed := true
-      t' := .brCmp op l r t2 ta e2 ea
+      let (t2, ta2, c1) := rewriteEdge t ta
+      let (e2, ea2, c2) := rewriteEdge e ea
+      if c1 || c2 then changed := true
+      t' := .brCmp op l r t2 ta2 e2 ea2
     | .brCmpImm op l imm t ta e ea =>
-      let t2 := resolveBlk t; let e2 := resolveBlk e
-      if t2 != t || e2 != e then changed := true
-      t' := .brCmpImm op l imm t2 ta e2 ea
+      let (t2, ta2, c1) := rewriteEdge t ta
+      let (e2, ea2, c2) := rewriteEdge e ea
+      if c1 || c2 then changed := true
+      t' := .brCmpImm op l imm t2 ta2 e2 ea2
     | _ => pure ()
     rewritten := rewritten.push { blk with term := t' }
+  if let some sBlk := extraSharedRet? then
+    rewritten := rewritten.push sBlk
+    changed := true
 
   -- BFS reachability from block 0
   let mut blkMap : Std.HashMap BlockId Block := {}
@@ -626,7 +669,7 @@ private def cfgCleanupPass (f : Func) : Func × Bool := Id.run do
 
   let kept := rewritten.filter (fun b => visited.contains b.id)
   if kept.size != rewritten.size then changed := true
-  return ({ f with blocks := kept }, changed)
+  return ({ f with blocks := kept, nextVReg := nextVReg }, changed)
 
 /-- Balanced Binary-Search Switch Dispatch Pass:
     Detects linear `if disc == c0 then t0 else if disc == c1 then t1 ...` dispatch chains

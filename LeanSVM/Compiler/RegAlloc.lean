@@ -111,13 +111,29 @@ private def computeIntervals (f : Func) (blocks : Array Block) : Array LiveInter
   let mut useCounts : Std.HashMap VReg Nat := {}
   let mut coalesceHints : Std.HashMap VReg VReg := {}
 
-  let bumpUse (m : Std.HashMap VReg Nat) (v : VReg) : Std.HashMap VReg Nat :=
-    m.insert v (m.getD v 0 + 1)
+  let bumpUse (m : Std.HashMap VReg Nat) (v : VReg) (w : Nat) : Std.HashMap VReg Nat :=
+    m.insert v (m.getD v 0 + w)
 
   let mut blkMap : Std.HashMap BlockId Block := {}
-  for blk in blocks do blkMap := blkMap.insert blk.id blk
+  let mut blkIdx : Std.HashMap BlockId Nat := {}
+  for idx in [0:blocks.size] do
+    let blk := blocks[idx]!
+    blkMap := blkMap.insert blk.id blk
+    blkIdx := blkIdx.insert blk.id idx
+
+  -- Detect natural loop blocks (any block between a back-edge target and its source in RPO)
+  -- and weight their uses 10x so loop-carried variables always win physical registers!
+  let mut inLoop : Std.HashSet BlockId := {}
+  for idx in [0:blocks.size] do
+    let blk := blocks[idx]!
+    for s in blk.term.succs do
+      if let some sIdx := blkIdx.get? s then
+        if sIdx <= idx then
+          for li in [sIdx : idx + 1] do
+            inLoop := inLoop.insert blocks[li]!.id
 
   for blk in blocks do
+    let w : Nat := if inLoop.contains blk.id then 10 else 1
     let mut uses : Std.HashSet VReg := {}
     let mut defs : Std.HashSet VReg := {}
     for bp in blk.params do defs := defs.insert bp
@@ -125,7 +141,7 @@ private def computeIntervals (f : Func) (blocks : Array Block) : Array LiveInter
       for fp in f.params do defs := defs.insert fp
     for s in blk.stmts do
       for u in s.usedRegs do
-        useCounts := bumpUse useCounts u
+        useCounts := bumpUse useCounts u w
         if !defs.contains u then uses := uses.insert u
       if let some d := s.defReg? then
         defs := defs.insert d
@@ -135,7 +151,7 @@ private def computeIntervals (f : Func) (blocks : Array Block) : Array LiveInter
           coalesceHints := coalesceHints.insert d l
         | _ => pure ()
     for u in blk.term.usedRegs do
-      useCounts := bumpUse useCounts u
+      useCounts := bumpUse useCounts u w
       if !defs.contains u then uses := uses.insert u
     -- Coalescing hint: block parameters prefer their incoming edge arguments!
     let recordEdgeHints (m : Std.HashMap VReg VReg) (tgt : BlockId) (args : Array VReg) :=
@@ -240,6 +256,27 @@ private def computeIntervals (f : Func) (blocks : Array Block) : Array LiveInter
   let mut paramPref : Std.HashMap VReg SBPF.Reg := {}
   for idx in [0:min f.params.size 5] do
     paramPref := paramPref.insert f.params[idx]! argRegs[idx]!
+  -- Hint shared `ret(p)` tail blocks and their incoming edge args to `r1` so error-return edges are 0-insn no-ops!
+  let mut sharedRetBlks : Std.HashSet BlockId := {}
+  for blk in blocks do
+    if blk.id != 0 && blk.params.size == 1 && blk.stmts.isEmpty then
+      match blk.term with
+      | .ret rv =>
+        if rv == blk.params[0]! then
+          sharedRetBlks := sharedRetBlks.insert blk.id
+          if !paramPref.contains rv then paramPref := paramPref.insert rv SBPF.Reg.r1
+      | _ => pure ()
+  if !sharedRetBlks.isEmpty then
+    let hintRetEdge (m : Std.HashMap VReg SBPF.Reg) (tgt : BlockId) (args : Array VReg) :=
+      if sharedRetBlks.contains tgt && args.size == 1 && !m.contains args[0]! then
+        m.insert args[0]! SBPF.Reg.r1
+      else m
+    for blk in blocks do
+      match blk.term with
+      | .jmp t a => paramPref := hintRetEdge paramPref t a
+      | .br _ t ta e ea | .brCmp _ _ _ t ta e ea | .brCmpImm _ _ _ t ta e ea =>
+        paramPref := hintRetEdge (hintRetEdge paramPref t ta) e ea
+      | _ => pure ()
 
   let mut intervals : Array LiveInterval := #[]
   for (v, dPos) in firstDef.toList do

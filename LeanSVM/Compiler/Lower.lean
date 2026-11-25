@@ -60,6 +60,8 @@ structure LowerState where
   stackAllocBytes : Nat := 0
   /-- Reusable 8-byte stack slot for fallible outlined `SolanaM α` helper out-pointers. -/
   callRetSlotOff? : Option Int16 := none
+  /-- Reusable stack arg-pack buffer `(baseOff, byteCap)` for `> 5`-arg outlined helpers. -/
+  callArgsPack?   : Option (Int16 × Nat) := none
   /-- Stack of active inlined-function frames for tail-recursion loop detection. -/
   activeRecLoops  : List (Name × BlockId × Array VReg × Array Bool) := []
   /-- Outlined pure scalar helper functions (compiled once, called via 1-CU sBPF `call`). -/
@@ -142,6 +144,35 @@ private def getOrAllocCallRetSlot : LowerM (VReg × Int16) := do
     let r ← freshVReg
     emit (.stackAddr r sOff)
     return (r, sOff)
+
+/-- Reuse a stack arg-pack buffer of at least `needBytes` bytes for `> 5`-arg outlined helpers. -/
+private def getOrAllocArgsPack (needBytes : Nat) : LowerM (VReg × Int16) := do
+  let aligned := ((needBytes + 7) / 8) * 8
+  let st ← get
+  match st.callArgsPack? with
+  | some (sOff, cap) =>
+    if cap >= aligned then
+      let r ← freshVReg
+      emit (.stackAddr r sOff)
+      return (r, sOff)
+    else
+      let newTotal := st.stackAllocBytes + aligned
+      if newTotal > 4096 then
+        throw s!"stack allocation exceeds Solana 4KB frame limit ({newTotal} bytes)"
+      let newOff := Int16.ofInt (-(newTotal : Int))
+      set { st with stackAllocBytes := newTotal, callArgsPack? := some (newOff, aligned) }
+      let r ← freshVReg
+      emit (.stackAddr r newOff)
+      return (r, newOff)
+  | none =>
+    let newTotal := st.stackAllocBytes + aligned
+    if newTotal > 4096 then
+      throw s!"stack allocation exceeds Solana 4KB frame limit ({newTotal} bytes)"
+    let newOff := Int16.ofInt (-(newTotal : Int))
+    set { st with stackAllocBytes := newTotal, callArgsPack? := some (newOff, aligned) }
+    let r ← freshVReg
+    emit (.stackAddr r newOff)
+    return (r, newOff)
 
 /-- Materialize a `Val` as a single scalar `VReg`. -/
 private def valToReg (v : Val) : LowerM VReg := do
@@ -743,7 +774,7 @@ private def nonErasedParamCount (d : Decl .pure) : Nat :=
 
 private def isInfallibleSvmHelper (d : Decl .pure) : Bool :=
   let cnt := nonErasedParamCount d
-  if cnt > 5 then false
+  if cnt > 12 then false
   else
     match d.value with
     | .code body => isSvmStepScalarType d.type && !containsSvmErr body
@@ -751,7 +782,7 @@ private def isInfallibleSvmHelper (d : Decl .pure) : Bool :=
 
 private def isFallibleSvmHelper (d : Decl .pure) : Bool :=
   let cnt := nonErasedParamCount d
-  if cnt > 4 then false
+  if cnt > 12 then false
   else
     match d.value with
     | .code body => isSvmStepScalarType d.type && containsSvmErr body
@@ -759,11 +790,11 @@ private def isFallibleSvmHelper (d : Decl .pure) : Bool :=
 
 private def isScalarHelper (d : Decl .pure) : Bool :=
   let cnt := nonErasedParamCount d
-  cnt >= 1 && cnt <= 5 && isScalarType d.type
+  cnt >= 1 && cnt <= 12 && isScalarType d.type
 
 private def isSvmUnitHelper (d : Decl .pure) : Bool :=
   let cnt := nonErasedParamCount d
-  cnt <= 5 && isSvmStepUnitType d.type
+  cnt <= 12 && isSvmStepUnitType d.type
 
 /-- Lower LCNF `Code .pure` into `SbfIR` blocks.
     `onReturn` handles `.return fvar` (either exiting the entrypoint or jumping to an inlined caller's continuation). -/
@@ -872,6 +903,11 @@ partial def lowerCode
                   let isFallibleSvm := isFallibleSvmHelper calleeDecl
                   let isScalar := isScalarHelper calleeDecl
                   if autoOut && (isScalar || isSvmUnit || isInfallibleSvm || isFallibleSvm) then
+                    let numValArgs := nonErasedParamCount calleeDecl
+                    let totalPassSlots := numValArgs + (if isFallibleSvm then 1 else 0)
+                    let usesPack := totalPassSlots > 5
+                    let packBytes := (totalPassSlots - 4) * 8
+                    let retPackOff : Int16 := Int16.ofInt ((numValArgs - 4) * 8)
                     let fnLabel ← match (← get).outlinedNames.get? declName with
                       | some lbl => pure lbl
                       | none =>
@@ -887,41 +923,76 @@ partial def lowerCode
                         let savedNextVReg := (← get).nextVReg
                         let savedStack := (← get).stackAllocBytes
                         let savedRetSlot := (← get).callRetSlotOff?
+                        let savedArgsPack := (← get).callArgsPack?
                         let savedLoops := (← get).activeRecLoops
                         modify fun st => { st with
                           blocks := #[], curBlock := 0, nextVReg := 0,
-                          stackAllocBytes := 0, callRetSlotOff? := none, activeRecLoops := []
+                          stackAllocBytes := 0, callRetSlotOff? := none,
+                          callArgsPack? := none, activeRecLoops := []
                         }
                         let hEntryBlk ← newBlock #[]
                         switchBlock hEntryBlk
                         let mut hParams : Array VReg := #[]
+                        let mut hValRegs : Array VReg := #[]
                         let mut hKinds : Array Bool := #[]
                         let mut hEnv : Std.HashMap FVarId Val := {}
-                        for p in calleeDecl.params do
-                          if isErasedType p.type then
-                            hKinds := hKinds.push false
-                            hEnv := hEnv.insert p.fvarId .erased
-                          else
-                            let pr ← freshVReg
-                            hParams := hParams.push pr
-                            hKinds := hKinds.push true
-                            hEnv := hEnv.insert p.fvarId (.reg pr)
-                        -- For fallible `SolanaM α` helpers, append hidden `outPtr` parameter (`r_{k+1}`)!
-                        let outPtrReg? ← if isFallibleSvm then
-                            let op ← freshVReg
-                            hParams := hParams.push op
-                            pure (some op)
+                        let mut packPtrReg? : Option VReg := none
+                        if usesPack then
+                          -- First 4 value params arrive in `r1..r4`; `r5` is stack arg-pack pointer!
+                          let mut valIdx : Nat := 0
+                          let mut overflowParams : Array (FVarId × Nat) := #[]
+                          for p in calleeDecl.params do
+                            if isErasedType p.type then
+                              hKinds := hKinds.push false
+                              hEnv := hEnv.insert p.fvarId .erased
+                            else
+                              hKinds := hKinds.push true
+                              if valIdx < 4 then
+                                let pr ← freshVReg
+                                hParams := hParams.push pr
+                                hValRegs := hValRegs.push pr
+                                hEnv := hEnv.insert p.fvarId (.reg pr)
+                              else
+                                overflowParams := overflowParams.push (p.fvarId, valIdx - 4)
+                              valIdx := valIdx + 1
+                          let packReg ← freshVReg
+                          hParams := hParams.push packReg
+                          packPtrReg? := some packReg
+                          for (fid, slotIdx) in overflowParams do
+                            let vr ← freshVReg
+                            emit (.load .b8 vr packReg (Int16.ofInt (slotIdx * 8)))
+                            hValRegs := hValRegs.push vr
+                            hEnv := hEnv.insert fid (.reg vr)
+                        else
+                          for p in calleeDecl.params do
+                            if isErasedType p.type then
+                              hKinds := hKinds.push false
+                              hEnv := hEnv.insert p.fvarId .erased
+                            else
+                              let pr ← freshVReg
+                              hParams := hParams.push pr
+                              hValRegs := hValRegs.push pr
+                              hKinds := hKinds.push true
+                              hEnv := hEnv.insert p.fvarId (.reg pr)
+                        -- For fallible `SolanaM α` helpers, determine `(outPtrReg, outOff)`!
+                        let outPtrInfo? : Option (VReg × Int16) ← if isFallibleSvm then
+                            match packPtrReg? with
+                            | some pr => pure (some (pr, retPackOff))
+                            | none =>
+                              let op ← freshVReg
+                              hParams := hParams.push op
+                              pure (some (op, 0))
                           else pure none
                         let helperRet : Val → LowerM Unit :=
                           if isSvmUnit then lowerEntryReturn
                           else if isInfallibleSvm then fun rv => do
                             let r ← extractLoopVal rv
                             setTerm (.ret r)
-                          else if let some outPtrReg := outPtrReg? then fun rv => do
+                          else if let some (outPtrReg, outOff) := outPtrInfo? then fun rv => do
                             match rv with
                             | .ctorVal 0 fields =>
                               let vr ← valToReg (fields.getD 0 .erased)
-                              emit (.store .b8 outPtrReg 0 vr)
+                              emit (.store .b8 outPtrReg outOff vr)
                               let z ← emitConst 0
                               setTerm (.ret z)
                             | .ctorVal 1 fields =>
@@ -932,14 +1003,14 @@ partial def lowerCode
                               let errB ← newBlock
                               setTerm (.brCmpImm .eq tag 0 okB #[] errB #[])
                               switchBlock okB
-                              emit (.store .b8 outPtrReg 0 (payloads.getD 0 tag))
+                              emit (.store .b8 outPtrReg outOff (payloads.getD 0 tag))
                               let z ← emitConst 0
                               setTerm (.ret z)
                               switchBlock errB
                               setTerm (.ret (payloads.getD 0 tag))
                             | other =>
                               let vr ← valToReg other
-                              emit (.store .b8 outPtrReg 0 vr)
+                              emit (.store .b8 outPtrReg outOff vr)
                               let z ← emitConst 0
                               setTerm (.ret z)
                           else fun rv => do let r ← valToReg rv; setTerm (.ret r)
@@ -954,8 +1025,7 @@ partial def lowerCode
                               loopParams := loopParams.push lr
                               loopEnv := loopEnv.insert p.fvarId (.reg lr)
                           let lBlk ← newBlock loopParams
-                          let initLoopArgs := if isFallibleSvm then hParams.pop else hParams
-                          setTerm (.jmp lBlk initLoopArgs)
+                          setTerm (.jmp lBlk hValRegs)
                           switchBlock lBlk
                           modify fun st => { st with activeRecLoops := [(declName, lBlk, loopParams, hKinds)] }
                           lowerCode calleeBody loopEnv {} helperRet (fuel - 1)
@@ -977,6 +1047,7 @@ partial def lowerCode
                           nextVReg := savedNextVReg
                           stackAllocBytes := savedStack
                           callRetSlotOff? := savedRetSlot
+                          callArgsPack? := savedArgsPack
                           activeRecLoops := savedLoops
                           outlinedHelpers := st.outlinedHelpers.push helperFunc
                         }
@@ -985,15 +1056,29 @@ partial def lowerCode
                     for idx in [0:calleeDecl.params.size] do
                       if !isErasedType calleeDecl.params[idx]!.type then
                         callArgs := callArgs.push (← valToReg (argVals.getD idx .erased))
+                    let (passArgs, outSlotOff?) : Array VReg × Option Int16 ←
+                      if usesPack then
+                        let (packPtrReg, packBaseOff) ← getOrAllocArgsPack packBytes
+                        for idx in [4:callArgs.size] do
+                          let sOff := Int16.ofInt (packBaseOff.toInt + ((idx - 4) * 8 : Int))
+                          emit (.storeStack .b8 sOff callArgs[idx]!)
+                        let regArgs := #[callArgs[0]!, callArgs[1]!, callArgs[2]!, callArgs[3]!, packPtrReg]
+                        let rOff? := if isFallibleSvm then some (Int16.ofInt (packBaseOff.toInt + retPackOff.toInt)) else none
+                        pure (regArgs, rOff?)
+                      else if isFallibleSvm then
+                        let (outPtrReg, outOff) ← getOrAllocCallRetSlot
+                        pure (callArgs.push outPtrReg, some outOff)
+                      else
+                        pure (callArgs, none)
                     if isSvmUnit && !containsSvmErr calleeBody then
                       -- Infallible `SolanaM Unit` helper: 1-instruction `call`, ZERO error check!
-                      emit (.call none fnLabel callArgs)
+                      emit (.call none fnLabel passArgs)
                       pure (.ctorVal 0 #[.erased, .erased])
                     else if isFallibleSvm then
-                      -- Fallible `SolanaM α` helper: pass shared 8-byte out-slot, check `r0 == 0`, load result!
-                      let (outPtrReg, outSlotOff) ← getOrAllocCallRetSlot
+                      -- Fallible `SolanaM α` helper: check `r0 == 0`, load result from stack out-slot!
+                      let outSlotOff := outSlotOff?.getD 0
                       let resReg ← freshVReg
-                      emit (.call (some resReg) fnLabel (callArgs.push outPtrReg))
+                      emit (.call (some resReg) fnLabel passArgs)
                       let okBlk ← newBlock #[]
                       let errBlk ← newBlock #[]
                       setTerm (.brCmpImm .eq resReg 0 okBlk #[] errBlk #[])
@@ -1008,7 +1093,7 @@ partial def lowerCode
                       return ()
                     else
                     let resReg ← freshVReg
-                    emit (.call (some resReg) fnLabel callArgs)
+                    emit (.call (some resReg) fnLabel passArgs)
                     if isSvmUnit then
                       let isTailRet := match k with | .return retFid => retFid == decl.fvarId | _ => false
                       if isTailRet then
