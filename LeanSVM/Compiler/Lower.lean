@@ -661,18 +661,59 @@ private def isSvmStepScalarType (ty : Expr) : Bool :=
     n == ``LeanSVM.SvmStep && isScalarType arg
   | _, _ => false
 
-private partial def containsSvmErr (c : Code .pure) : Bool :=
-  match c with
+private def isSvmStepType (ty : Expr) : Bool :=
+  match (peelForallTy ty).getAppFn with
+  | .const n _ => n == ``LeanSVM.SvmStep
+  | _ => false
+
+/-- Conservatively check whether `c` can transitively produce `SvmStep.err`.
+    Fail-safe by default: returns `true` on `SvmStep.err`, `SolanaM.fail`, `SolanaM.require`,
+    `sysInvokeSignedC`, unknown/external `SvmStep` functions, dynamic closure calls, or fuel
+    exhaustion. Recurses into all called LCNF declarations so wrappers like
+    `checkDexVaultAndMint` (which only call `checkTokenProg` / `requireKeyEq`) are ALWAYS
+    classified as fallible! -/
+private partial def codeMayFail (env : Environment) (c : Code .pure)
+    (visited : Std.HashSet Name := {}) (fuel : Nat := 32) : Bool :=
+  if fuel == 0 then true
+  else match c with
   | .let d k =>
-    let hit := match d.value with
-      | .const n _ _ _ => n == ``LeanSVM.SvmStep.err || n == ``LeanSVM.SolanaM.fail
+    let declMayFail : Bool :=
+      match d.value with
+      | .const n _ _ _ =>
+        if n == ``LeanSVM.SvmStep.err || n == ``LeanSVM.SolanaM.fail ||
+           n == ``LeanSVM.SolanaM.require || n == ``LeanSVM.sysInvokeSignedC then
+          true
+        else if n == ``LeanSVM.SvmStep.ok || isCtor env n then
+          false
+        else if n == ``LeanSVM.rawLoadU8 || n == ``LeanSVM.rawLoadU16 ||
+                n == ``LeanSVM.rawLoadU32 || n == ``LeanSVM.rawLoadU64 ||
+                n == ``LeanSVM.rawStoreU8 || n == ``LeanSVM.rawStoreU16 ||
+                n == ``LeanSVM.rawStoreU32 || n == ``LeanSVM.rawStoreU64 ||
+                n == ``LeanSVM.rawStackAlloc || n == ``LeanSVM.sysLog ||
+                n == ``LeanSVM.sysLog64 || n == ``LeanSVM.sysLogComputeUnits ||
+                n == ``LeanSVM.sysMemcpy || n == ``LeanSVM.sysMemset ||
+                n == ``LeanSVM.sysGetClock || n == ``LeanSVM.sysSha256 then
+          false
+        else if visited.contains n then
+          false
+        else
+          match lookupDecl? env n with
+          | some subDecl =>
+            match subDecl.value with
+            | .code subBody => codeMayFail env subBody (visited.insert n) (fuel - 1)
+            | .extern _ => isSvmStepType subDecl.type
+          | none =>
+            match env.find? n with
+            | some ci => isSvmStepType ci.type
+            | none => true
+      | .fvar _ args => !args.isEmpty
       | _ => false
-    hit || containsSvmErr k
-  | .jp d k => containsSvmErr d.value || containsSvmErr k
-  | .fun d k _ => containsSvmErr d.value || containsSvmErr k
+    declMayFail || codeMayFail env k visited fuel
+  | .jp d k => codeMayFail env d.value visited fuel || codeMayFail env k visited fuel
+  | .fun d k _ => codeMayFail env d.value visited fuel || codeMayFail env k visited fuel
   | .cases cs => cs.alts.any fun a =>
     match a with
-    | .alt _ _ body _ | .default body | .ctorAlt _ body _ => containsSvmErr body
+    | .alt _ _ body _ | .default body | .ctorAlt _ body _ => codeMayFail env body visited fuel
   | _ => false
 
 private def shouldInlineSmallHelper (callCounts : Std.HashMap Name Nat) (n : Name) : Bool :=
@@ -772,20 +813,20 @@ private def shouldAutoOutline (env : Environment) (callCounts : Std.HashMap Name
 private def nonErasedParamCount (d : Decl .pure) : Nat :=
   d.params.foldl (fun c p => if isErasedType p.type then c else c + 1) 0
 
-private def isInfallibleSvmHelper (d : Decl .pure) : Bool :=
+private def isInfallibleSvmHelper (env : Environment) (d : Decl .pure) : Bool :=
   let cnt := nonErasedParamCount d
   if cnt > 12 then false
   else
     match d.value with
-    | .code body => isSvmStepScalarType d.type && !containsSvmErr body
+    | .code body => isSvmStepScalarType d.type && !codeMayFail env body
     | _ => false
 
-private def isFallibleSvmHelper (d : Decl .pure) : Bool :=
+private def isFallibleSvmHelper (env : Environment) (d : Decl .pure) : Bool :=
   let cnt := nonErasedParamCount d
   if cnt > 12 then false
   else
     match d.value with
-    | .code body => isSvmStepScalarType d.type && containsSvmErr body
+    | .code body => isSvmStepScalarType d.type && codeMayFail env body
     | _ => false
 
 private def isScalarHelper (d : Decl .pure) : Bool :=
@@ -899,8 +940,8 @@ partial def lowerCode
                   let cc := (← get).callCounts
                   let autoOut := shouldAutoOutline env cc calleeDecl
                   let isSvmUnit := isSvmUnitHelper calleeDecl
-                  let isInfallibleSvm := isInfallibleSvmHelper calleeDecl
-                  let isFallibleSvm := isFallibleSvmHelper calleeDecl
+                  let isInfallibleSvm := isInfallibleSvmHelper env calleeDecl
+                  let isFallibleSvm := isFallibleSvmHelper env calleeDecl
                   let isScalar := isScalarHelper calleeDecl
                   if autoOut && (isScalar || isSvmUnit || isInfallibleSvm || isFallibleSvm) then
                     let numValArgs := nonErasedParamCount calleeDecl
@@ -1070,8 +1111,8 @@ partial def lowerCode
                         pure (callArgs.push outPtrReg, some outOff)
                       else
                         pure (callArgs, none)
-                    if isSvmUnit && !containsSvmErr calleeBody then
-                      -- Infallible `SolanaM Unit` helper: 1-instruction `call`, ZERO error check!
+                    if isSvmUnit && !codeMayFail env calleeBody then
+                      -- Transitively-verified infallible `SolanaM Unit` helper: 1-instruction `call`, ZERO error check!
                       emit (.call none fnLabel passArgs)
                       pure (.ctorVal 0 #[.erased, .erased])
                     else if isFallibleSvm then
@@ -1139,27 +1180,14 @@ partial def lowerCode
                     setTerm (.jmp loopBlk initArgs)
                     switchBlock loopBlk
                     -- Push active loop onto stack & lower body; if continuation `k` is trivial `return decl.fvarId`,
-                    -- forward directly to `onReturn`! Otherwise jump to a post-loop join block!
+                    -- forward directly to `onReturn`! Otherwise ALWAYS join `(tagReg, payReg)` so errors propagate!
                     modify fun st => { st with activeRecLoops := (declName, loopBlk, pRegs, pKinds) :: st.activeRecLoops }
-                    match k with
-                    | .return retFid =>
-                      if retFid == decl.fvarId then
-                        lowerCode calleeBody calleeEnv {} onReturn (fuel - 1)
-                        modify fun st => { st with activeRecLoops := st.activeRecLoops.tail! }
-                        return ()
-                      else
-                        -- Continue after loop
-                        let resReg ← freshVReg
-                        let afterBlk ← newBlock #[resReg]
-                        lowerCode calleeBody calleeEnv {} (fun rv => do
-                          let r ← extractLoopVal rv
-                          setTerm (.jmp afterBlk #[r])) (fuel - 1)
-                        modify fun st => { st with activeRecLoops := st.activeRecLoops.tail! }
-                        switchBlock afterBlk
-                        let envMap' := envMap.insert decl.fvarId (.ctorVal 0 #[.reg resReg, .erased])
-                        lowerCode k envMap' jpMap onReturn (fuel - 1)
-                        return ()
-                    | _ =>
+                    let isDirectTailRet := match k with | .return retFid => retFid == decl.fvarId | _ => false
+                    if isDirectTailRet then
+                      lowerCode calleeBody calleeEnv {} onReturn (fuel - 1)
+                      modify fun st => { st with activeRecLoops := st.activeRecLoops.tail! }
+                      return ()
+                    else
                       -- Loop produces a value consumed by continuation `k` (e.g. `let after ← skipAccounts ...; ...`)
                       let tagReg ← freshVReg
                       let payReg ← freshVReg

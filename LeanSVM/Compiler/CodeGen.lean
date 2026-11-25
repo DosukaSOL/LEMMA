@@ -68,38 +68,36 @@ def emitSingleLocMove (dst src : Loc) (memTmp : Reg) (out : Array Insn) : Array 
     | none => emitConst64 memTmp val out |>.push (.stx .b8 Reg.r10 memTmp doff)
   | .imm _, _ => out
 
+/-- Structurally recursive core of cycle-safe parallel location moves (total and kernel-transparent). -/
+def emitParallelLocMovesLoop : Nat → Array (Loc × Loc) → Reg → Reg → Array Insn → Array Insn
+  | 0, _, _, _, acc => acc
+  | fuel + 1, pending, cycleTmp, memTmp, acc =>
+    if pending.isEmpty then acc
+    else
+      match pending.findIdx? (fun m => !pending.any (fun p => p.2 == m.1)) with
+      | some idx =>
+        let (dst, src) := pending[idx]!
+        let pending' := pending.eraseIdx! idx
+        let acc' := emitSingleLocMove dst src memTmp acc
+        emitParallelLocMovesLoop fuel pending' cycleTmp memTmp acc'
+      | none =>
+        let (dst, src) := pending[0]!
+        let pending0 := pending.eraseIdx! 0
+        let acc1 := match dst with
+          | .reg dr => acc.push (.alu64Reg .mov cycleTmp dr)
+          | .stack doff => acc.push (.ldx .b8 cycleTmp Reg.r10 doff)
+          | .imm _ => acc
+        let pending' := pending0.map (fun p => if p.2 == dst then (p.1, .reg cycleTmp) else p)
+        let acc2 := emitSingleLocMove dst src memTmp acc1
+        emitParallelLocMovesLoop fuel pending' cycleTmp memTmp acc2
+
 /-- Emit cycle-safe parallel register/stack moves: `dsts[i] := srcs[i]`.
     `cycleTmp` (`r0`) breaks pure cycles; `memTmp` (`r5`, reserved whenever spills occur)
     handles stack-to-stack copies so `cycleTmp` is NEVER clobbered! -/
 def emitParallelLocMoves (moves : Array (Loc × Loc)) (cycleTmp : Reg) (memTmp : Reg := Reg.r5)
-    (out : Array Insn) : Array Insn := Id.run do
-  let mut pending := moves.filter (fun p => p.1 != p.2)
-  let mut acc := out
-  let mut guard := pending.size * 4 + 16
-  while !pending.isEmpty && guard > 0 do
-    guard := guard - 1
-    let mut readyIdx? : Option Nat := none
-    for i in [0:pending.size] do
-      let dst := pending[i]!.1
-      let readByOther := pending.any (fun p => p.2 == dst)
-      if !readByOther then
-        readyIdx? := some i
-        break
-    match readyIdx? with
-    | some idx =>
-      let (dst, src) := pending[idx]!
-      pending := pending.eraseIdx! idx
-      acc := emitSingleLocMove dst src memTmp acc
-    | none =>
-      let (dst, src) := pending[0]!
-      pending := pending.eraseIdx! 0
-      acc := match dst with
-        | .reg dr => acc.push (.alu64Reg .mov cycleTmp dr)
-        | .stack doff => acc.push (.ldx .b8 cycleTmp Reg.r10 doff)
-        | .imm _ => acc
-      pending := pending.map (fun p => if p.2 == dst then (p.1, .reg cycleTmp) else p)
-      acc := emitSingleLocMove dst src memTmp acc
-  return acc
+    (out : Array Insn) : Array Insn :=
+  let pending := moves.filter (fun p => p.1 != p.2)
+  emitParallelLocMovesLoop (pending.size * 4 + 16) pending cycleTmp memTmp out
 
 /-- Check whether an edge's block-parameter moves are all 0-instruction no-ops. -/
 private def isNoopEdge (alloc : AllocResult) (blkMap : Std.HashMap BlockId Block)
