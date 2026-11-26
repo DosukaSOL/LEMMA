@@ -384,4 +384,122 @@ def validateProgramCFG (prog : Program) : Except String Unit :=
   else
     .error s!"[lean-svm] translation validation failed for program '{prog.entry.name}' (CFG / call-graph / immediate invariant violation)"
 
+/-! ### 3. Formally Verified Post-Peephole Final sBPF Instruction-Stream Validator -/
+
+/-- Memory access byte width for `MemSize`. -/
+def memSizeBytes : MemSize → Int
+  | .b1 => 1
+  | .b2 => 2
+  | .b4 => 4
+  | .b8 => 8
+
+/-- Valid sBPF register index (`r0..r10`). -/
+def isValidSbpfReg (r : Reg) : Bool :=
+  r.idx.toNat ≤ 10
+
+/-- Writable sBPF register (`r0..r9`, NEVER read-only stack frame pointer `r10`). -/
+def isWritableSbpfReg (r : Reg) : Bool :=
+  r.idx.toNat ≤ 9
+
+/-- Check stack-frame bounds for any `r10`-relative memory access: strictly inside `[-4096, -width]`. -/
+def stackAccessLegal (base : Reg) (sz : MemSize) (off : Int16) : Bool :=
+  if base == Reg.r10 then
+    (-4096 : Int) ≤ off.toInt && off.toInt + memSizeBytes sz ≤ 0
+  else true
+
+/-- Check ALU immediate legality for both sBPF v0 and strict sBPF v3. -/
+def sbpfAluImmLegal (is64 : Bool) (op : AluOp) (imm : Int32) : Bool :=
+  match op with
+  | .lsh | .rsh | .arsh =>
+    0 ≤ imm.toInt && imm.toInt < (if is64 then 64 else 32)
+  | .sub => imm.toInt ≠ -2147483648
+  | .div | .mod => imm.toInt ≠ 0
+  | _ => true
+
+/-- Pure, total Agave sBPF v0/v3 instruction-level safety predicate checked on EVERY emitted
+    instruction AFTER `SBPF.peepholeOptimize` and BEFORE `SBPF.emitElf`! -/
+def checkSbpfInsn (labels : Std.HashSet String) : Insn → Bool
+  | .label _ => true
+  | .alu64Reg _ d s => isWritableSbpfReg d && isValidSbpfReg s
+  | .alu64Imm op d imm => isWritableSbpfReg d && sbpfAluImmLegal true op imm
+  | .alu32Reg _ d s => isWritableSbpfReg d && isValidSbpfReg s
+  | .alu32Imm op d imm => isWritableSbpfReg d && sbpfAluImmLegal false op imm
+  | .neg64 d => isWritableSbpfReg d
+  | .lddw d _ => isWritableSbpfReg d
+  | .lddwRodata d _ => isWritableSbpfReg d
+  | .ldx sz d base off =>
+    isWritableSbpfReg d && isValidSbpfReg base && stackAccessLegal base sz off
+  | .stx sz base src off =>
+    isValidSbpfReg base && isValidSbpfReg src && stackAccessLegal base sz off
+  | .stImm sz base off _ =>
+    isValidSbpfReg base && stackAccessLegal base sz off
+  | .ja tgt => labels.contains tgt
+  | .jccReg _ d s tgt => isValidSbpfReg d && isValidSbpfReg s && labels.contains tgt
+  | .jccImm _ d _ tgt => isValidSbpfReg d && labels.contains tgt
+  | .callLocal tgt => labels.contains tgt
+  | .callSyscall _ => true
+  | .exit => true
+
+/-- Extract the last non-label instruction in a list (verifying no fall-through past end of `.text`). -/
+def lastNonLabel? : List Insn → Option Insn
+  | [] => none
+  | .label _ :: rest => lastNonLabel? rest
+  | insn :: rest =>
+    match lastNonLabel? rest with
+    | some last => some last
+    | none => some insn
+
+/-- Pure post-peephole sBPF stream certificate checker:
+    1. Unique label definitions (no duplicate jump targets)
+    2. Every instruction satisfies `checkSbpfInsn` (valid regs, `r10` read-only, stack `[-4096, -width]`,
+       legal shift/div/mod/sub32/64 immediates, every jump/call target resolves to a defined label)
+    3. Final non-label instruction is `.exit` or `.ja _` (zero fall-through past `.text`!). -/
+def checkSbpfProgram (insns : List Insn) : Bool :=
+  let (labels, uniqueOk) := insns.foldl
+    (fun (acc : Std.HashSet String × Bool) insn =>
+      match insn with
+      | .label name =>
+        if acc.1.contains name then (acc.1, false) else (acc.1.insert name, acc.2)
+      | _ => acc)
+    ({}, true)
+  let endsCleanly :=
+    match lastNonLabel? insns with
+    | some .exit | some (.ja _) => true
+    | _ => false
+  uniqueOk && endsCleanly && insns.all (checkSbpfInsn labels)
+
+/-- Soundness theorem for post-peephole sBPF translation validation:
+    whenever `checkSbpfProgram insns = true`, EVERY emitted instruction in `insns` satisfies
+    `checkSbpfInsn` against the exact unique label set AND the stream terminates cleanly! -/
+theorem checkSbpfProgram_sound (insns : List Insn) (h : checkSbpfProgram insns = true) :
+    let labels := (insns.foldl
+      (fun (acc : Std.HashSet String × Bool) insn =>
+        match insn with
+        | .label name =>
+          if acc.1.contains name then (acc.1, false) else (acc.1.insert name, acc.2)
+        | _ => acc)
+      ({}, true)).1
+    (∀ insn ∈ insns, checkSbpfInsn labels insn = true) ∧
+    (lastNonLabel? insns = some .exit ∨ ∃ tgt, lastNonLabel? insns = some (.ja tgt)) := by
+  unfold checkSbpfProgram at h
+  dsimp only at h
+  simp only [Bool.and_eq_true] at h
+  refine ⟨fun insn hmem => List.all_eq_true.mp h.2 insn hmem, ?_⟩
+  have hend := h.1.2
+  cases hl : lastNonLabel? insns with
+  | none => rw [hl] at hend; cases hend
+  | some i =>
+    rw [hl] at hend
+    cases i with
+    | exit => exact Or.inl rfl
+    | ja tgt => exact Or.inr ⟨tgt, rfl⟩
+    | _ => cases hend
+
+/-- Validate the final post-peephole sBPF instruction stream right before ELF emission. -/
+def validateSbpfProgram (entryName : String) (insns : Array Insn) : Except String Unit :=
+  if checkSbpfProgram insns.toList then
+    .ok ()
+  else
+    .error s!"[lean-svm] post-peephole sBPF translation validation failed for '{entryName}'"
+
 end LeanSVM.Compiler

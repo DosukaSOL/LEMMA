@@ -77,6 +77,7 @@ def compileEntrypoint (env : Environment) (entryName : Name) (opts : CompileOpti
     maxStack := max maxStack hAlloc.totalStackBytes
     totalSpills := totalSpills + hAlloc.spillCount
   let insns := SBPF.peepholeOptimize allInsns
+  validateSbpfProgram entryName.toString insns
   let alloc : AllocResult := { entryAlloc with totalStackBytes := maxStack, spillCount := totalSpills }
   let helperCount := optProg.helpers.size
   let asmDump := if opts.dumpAsm then SBPF.formatProgram insns else ""
