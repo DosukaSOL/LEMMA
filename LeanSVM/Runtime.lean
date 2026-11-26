@@ -140,6 +140,21 @@ theorem readU64_writeU64_disjoint (s : SvmState) (a b v : UInt64)
   rw [b0] at e0
   simp only [p41, p42, p43, e0, e1, e2, e3, e4, e5, e6, e7]
 
+theorem mem_writeU64_outside (s : SvmState) (a x v : UInt64)
+    (ha : a ≤ 0xFFFFFFFFFFFFFFF7) (hout : x < a ∨ a + 8 ≤ x) :
+    (s.writeU64 a v).mem x = s.mem x := by
+  unfold writeU64 writeU32 writeU16 writeU8
+  simp only
+  have c7 : (x == a + 4 + 2 + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c6 : (x == a + 4 + 2) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c5 : (x == a + 4 + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c4 : (x == a + 4) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c3 : (x == a + 2 + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c2 : (x == a + 2) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c1 : (x == a + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c0 : (x == a) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  simp [c7, c6, c5, c4, c3, c2, c1, c0]
+
 end SvmState
 
 /-!
