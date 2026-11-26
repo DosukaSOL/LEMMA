@@ -5,3 +5,6 @@ import Lemma.Math.MulDiv
 import Lemma.Math.ConstantProduct
 import Lemma.Math.FixedPoint
 import Lemma.Math.Witnesses
+import Lemma.Spec.Accounts
+import Lemma.Guard
+import Lemma.Examples.GuardedCounter

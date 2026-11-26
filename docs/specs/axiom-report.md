@@ -4,7 +4,7 @@
 
 Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 
-## LEMMA theorems (46)
+## LEMMA theorems (59)
 
 | Theorem | Axioms |
 |---|---|
@@ -17,6 +17,19 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 | `Lemma.Compiler.NatLowering.mul_exact_of_zero` | `propext` |
 | `Lemma.Compiler.NatLowering.sub_exact` | `Quot.sound`, `propext` |
 | `Lemma.Compiler.NatLowering.trunc32_exact` | `Quot.sound`, `propext` |
+| `Lemma.Examples.GuardedCounter.Proofs.entrypoint_checks` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Examples.GuardedCounter.Proofs.nextCursor_state` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Examples.GuardedCounter.Proofs.parse2_ok` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Examples.GuardedCounter.Proofs.skipAccounts_state` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.guard_bind_err` | `propext` |
+| `Lemma.Guard.guard_bind_ok` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.keyEq_eq` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireKey_guard` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireNonDup_guard` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireOwner_guard` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireSigner_guard` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireTag_guard` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireWritable_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Math.Rounding.ceil.sizeOf_spec` | _(none)_ |
 | `Lemma.Math.Rounding.floor.sizeOf_spec` | _(none)_ |
 | `Lemma.Math.Rounding.ofNat_ctorIdx` | _(none)_ |
@@ -96,6 +109,6 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 - `LeanSVM.SvmState.readU64_writeU64_disjoint`
 - `LeanSVM.SvmState.readU64_writeU64_same`
 
-## Runtime `Nat` lint (25 LEMMA runtime definitions)
+## Runtime `Nat` lint (37 LEMMA runtime definitions)
 
 No `Nat` arithmetic is reachable from any LEMMA runtime definition.

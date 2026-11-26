@@ -1,0 +1,12 @@
+# <Lean module>              <entrypoint declaration>                 <output name>
+# ── upstream lean-svm examples ──
+Examples.Noop                Examples.Noop.entrypoint                 noop
+Examples.Counter             Examples.Counter.entrypoint              counter
+Examples.Vault               Examples.Vault.entrypoint                vault
+Examples.HashCheck           Examples.HashCheck.entrypoint            hashcheck
+Examples.Amm                 Examples.Amm.entrypoint                  amm
+Examples.Lending             Examples.Lending.entrypoint              lending
+Examples.DutchAuction        Examples.DutchAuction.entrypoint         dutch_auction
+Examples.BondingCurve        Examples.BondingCurve.entrypoint         bonding_curve
+# ── LEMMA programs ──
+Lemma.Examples.GuardedCounter Lemma.Examples.GuardedCounter.entrypoint  guarded_counter
