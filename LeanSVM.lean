@@ -1,4 +1,5 @@
 import LeanSVM.Types
+import LeanSVM.Sha256
 import LeanSVM.Runtime
 import LeanSVM.Input
 import LeanSVM.Math

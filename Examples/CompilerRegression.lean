@@ -40,7 +40,7 @@ def entrypoint (input : Ptr) : SolanaM Unit := do
   let owned ← pubkeyEq (AccountView.ownerPtr outAcc) progId
   SolanaM.require owned Err.illegalOwner
   let dlen ← AccountView.dataLen outAcc
-  SolanaM.require (dlen == 192) Err.invalidAccountData
+  SolanaM.require (dlen == 224) Err.invalidAccountData
   SolanaM.require (ix.len == 42) Err.invalidInstructionData
 
   -- 1. Sign-extension edge cases on UInt32 arithmetic (crossing bit 31!)
@@ -116,5 +116,17 @@ def entrypoint (input : Ptr) : SolanaM Unit := do
     AccountView.writeDataU64 outAcc 160 (← loadU64 clockBuf 16)
     AccountView.writeDataU64 outAcc 168 (← loadU64 clockBuf 24)
     AccountView.writeDataU64 outAcc 176 (← loadU64 clockBuf 32)
+    -- 6. Multi-slice `sol_sha256(["ab", "c"])` differential check against `LeanSVM.Sha256.nist_abc`!
+    let shaSlices ← stackAlloc 32
+    let shaData   ← stackAlloc 8
+    storeU8 shaData 0 0x61 -- 'a'
+    storeU8 shaData 1 0x62 -- 'b'
+    storeU8 shaData 4 0x63 -- 'c'
+    storeU64 shaSlices 0  shaData
+    storeU64 shaSlices 8  2
+    storeU64 shaSlices 16 (shaData + 4)
+    storeU64 shaSlices 24 1
+    let rcSha ← sha256 shaSlices 2 (base + 184)
+    SolanaM.require (rcSha == 0) Err.invalidArgument
 
 end Examples.CompilerRegression

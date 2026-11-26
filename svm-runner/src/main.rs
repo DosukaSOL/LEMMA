@@ -259,8 +259,31 @@ fn test_hashcheck() {
     let expected: [u8; 32] = Sha256::digest(payload).into();
     assert_eq!(&acc_data[0..32], &expected[..]);
     assert_eq!(u64::from_le_bytes(acc_data[32..40].try_into().unwrap()), 123_456_789);
+
+    // Differential check against LeanSVM.Sha256 kernel-checked FIPS 180-4 NIST vectors ("", "abc", 56B two-block)
+    let nist_vectors: &[(&[u8], [u8; 32])] = &[
+        (b"", [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        ]),
+        (b"abc", [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+        ]),
+        (b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", [
+            0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8, 0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+            0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67, 0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+        ]),
+    ];
+    for (msg, want) in nist_vectors {
+        send_ix(&mut svm, &payer, &[], Instruction {
+            program_id, accounts: vec![AccountMeta::new(state_addr, false)], data: msg.to_vec(),
+        }).expect("hashcheck NIST vector failed");
+        let got = &svm.get_account(&state_addr).unwrap().data[0..32];
+        assert_eq!(got, &want[..], "sol_sha256 NIST vector mismatch for len={}", msg.len());
+    }
     println!(
-        "[PASS] HashCheck    | .so = {:>6} B | CUs = {:>5} (sha256 + clock + log)",
+        "[PASS] HashCheck    | .so = {:>6} B | CUs = {:>5} (sha256 + 3x NIST vectors + clock + log)",
         so.len(), meta.compute_units_consumed
     );
 }
@@ -930,7 +953,7 @@ fn test_compiler_optimizations() {
     // Pre-fill account with 0x55 so we verify both written bytes AND untouched sentinel bytes [124..128]
     svm.set_account(out_addr, Account {
         lamports: 1_000_000,
-        data: vec![0x55u8; 192],
+        data: vec![0x55u8; 224],
         owner: program_id,
         ..Default::default()
     }).unwrap();
@@ -989,7 +1012,13 @@ fn test_compiler_optimizations() {
     assert_eq!(u64::from_le_bytes(d[160..168].try_into().unwrap()), 42, "Clock.epoch mismatch");
     assert_eq!(u64::from_le_bytes(d[168..176].try_into().unwrap()), 43, "Clock.leader_schedule_epoch mismatch");
     assert_eq!(u64::from_le_bytes(d[176..184].try_into().unwrap()), 1_700_000_999, "Clock.unix_timestamp mismatch");
-    assert!(meta.compute_units_consumed < 450, "expected inline memsets + scalar guards + syscalls < 450 CUs, got {}", meta.compute_units_consumed);
+    // 6. Multi-slice sol_sha256(["ab", "c"]) must match LeanSVM.Sha256.nist_abc across all 32 bytes!
+    let nist_abc: [u8; 32] = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    ];
+    assert_eq!(&d[184..216], &nist_abc[..], "multi-slice sol_sha256([\"ab\", \"c\"]) 32B digest mismatch!");
+    assert!(meta.compute_units_consumed < 550, "expected inline memsets + scalar guards + syscalls < 550 CUs, got {}", meta.compute_units_consumed);
 
     // Also test positive non-zero Nat.sub (5 - 1 = 4) and positive non-zero div/mod (1000 / 7 = 142, 1000 % 7 = 6, 142 ^ 6 = 136)
     let mut ix_pos = Vec::with_capacity(42);

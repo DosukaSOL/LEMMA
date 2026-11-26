@@ -9,9 +9,247 @@
     and every `raw*` / `sys*` primitive compiles directly to 1 sBPF instruction or syscall.
 -/
 import LeanSVM.Types
+import LeanSVM.Sha256
 import Std.Tactic.BVDecide
 
 namespace LeanSVM
+
+/-! ### Raw Memory Helpers & Faithful CPI Invocation Model -/
+
+/-- Read a little-endian `UInt32` directly from a raw byte map `mem`. -/
+def memReadU32 (mem : UInt64 → UInt8) (addr : UInt64) : UInt32 :=
+  let b0 := (mem addr).toUInt32
+  let b1 := (mem (addr + 1)).toUInt32
+  let b2 := (mem (addr + 2)).toUInt32
+  let b3 := (mem (addr + 3)).toUInt32
+  b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+
+/-- Read a little-endian `UInt64` directly from a raw byte map `mem`. -/
+def memReadU64 (mem : UInt64 → UInt8) (addr : UInt64) : UInt64 :=
+  (memReadU32 mem addr).toUInt64 ||| ((memReadU32 mem (addr + 4)).toUInt64 <<< 32)
+
+/-- Write a single byte to a raw byte map `mem`. -/
+def memWriteU8 (mem : UInt64 → UInt8) (addr : UInt64) (v : UInt8) : UInt64 → UInt8 :=
+  fun a => if a == addr then v else mem a
+
+/-- Write a little-endian `UInt64` to a raw byte map `mem`. -/
+def memWriteU64 (mem : UInt64 → UInt8) (addr v : UInt64) : UInt64 → UInt8 :=
+  let m0 := memWriteU8 mem addr v.toUInt8
+  let m1 := memWriteU8 m0 (addr + 1) (v >>> 8).toUInt8
+  let m2 := memWriteU8 m1 (addr + 2) (v >>> 16).toUInt8
+  let m3 := memWriteU8 m2 (addr + 3) (v >>> 24).toUInt8
+  let m4 := memWriteU8 m3 (addr + 4) (v >>> 32).toUInt8
+  let m5 := memWriteU8 m4 (addr + 5) (v >>> 40).toUInt8
+  let m6 := memWriteU8 m5 (addr + 6) (v >>> 48).toUInt8
+  memWriteU8 m6 (addr + 7) (v >>> 56).toUInt8
+
+/-- Copy `n` bytes from `src` to `dst` inside a raw byte map `mem`. -/
+def memCopyBytes (mem : UInt64 → UInt8) (dst src : UInt64) : Nat → (UInt64 → UInt8)
+  | 0 => mem
+  | k + 1 => memCopyBytes (memWriteU8 mem dst (mem src)) (dst + 1) (src + 1) k
+
+/-- Zero `n` bytes starting at `dst` inside a raw byte map `mem`. -/
+def memZeroBytes (mem : UInt64 → UInt8) (dst : UInt64) : Nat → (UInt64 → UInt8)
+  | 0 => mem
+  | k + 1 => memZeroBytes (memWriteU8 mem dst 0) (dst + 1) k
+
+/-- Decoded 56-byte `SolAccountInfo` struct passed to `sol_invoke_signed_c`. -/
+structure CpiAccountInfo where
+  infoPtr     : UInt64
+  keyPtr      : UInt64
+  lamportsPtr : UInt64
+  dataLen     : UInt64
+  dataPtr     : UInt64
+  ownerPtr    : UInt64
+  isSigner    : Bool
+  isWritable  : Bool
+  deriving Repr, BEq
+
+/-- Decoded CPI call passed to `sol_invoke_signed_c(ixPtr, infosPtr, infosLen, seedsPtr, seedsLen)`. -/
+structure CpiInvocation where
+  progKeyPtr : UInt64
+  metasPtr   : UInt64
+  metasLen   : UInt64
+  dataPtr    : UInt64
+  dataLen    : UInt64
+  infos      : List CpiAccountInfo
+  seedsPtr   : UInt64
+  seedsLen   : UInt64
+  deriving Repr, BEq
+
+/-- Decode `n` consecutive 56-byte `SolAccountInfo` entries starting at `infosPtr`. -/
+def decodeCpiInfos (mem : UInt64 → UInt8) (infosPtr : UInt64) : Nat → List CpiAccountInfo
+  | 0 => []
+  | k + 1 =>
+    let info : CpiAccountInfo :=
+      { infoPtr     := infosPtr
+        keyPtr      := memReadU64 mem infosPtr
+        lamportsPtr := memReadU64 mem (infosPtr + 8)
+        dataLen     := memReadU64 mem (infosPtr + 16)
+        dataPtr     := memReadU64 mem (infosPtr + 24)
+        ownerPtr    := memReadU64 mem (infosPtr + 32)
+        isSigner    := mem (infosPtr + 48) != 0
+        isWritable  := mem (infosPtr + 49) != 0 }
+    info :: decodeCpiInfos mem (infosPtr + 56) k
+
+/-- Decode a 40-byte `SolInstruction` + `infosLen` `SolAccountInfo` array from `mem`. -/
+def decodeCpiInvocation (mem : UInt64 → UInt8)
+    (ixPtr infosPtr infosLen seedsPtr seedsLen : UInt64) : CpiInvocation :=
+  { progKeyPtr := memReadU64 mem ixPtr
+    metasPtr   := memReadU64 mem (ixPtr + 8)
+    metasLen   := memReadU64 mem (ixPtr + 16)
+    dataPtr    := memReadU64 mem (ixPtr + 24)
+    dataLen    := memReadU64 mem (ixPtr + 32)
+    infos      := decodeCpiInfos mem infosPtr infosLen.toNat
+    seedsPtr   := seedsPtr
+    seedsLen   := seedsLen }
+
+/-- Agave write-protection predicate for one `SolAccountInfo`: only writable accounts may have their
+    `lamports` (8B), `owner` (32B), `data_len` (`infoPtr+16` & `lamportsPtr+8`), or `data`
+    (up to `dataLen + 10240`, Agave's `MAX_PERMITTED_DATA_INCREASE`) modified by a CPI callee. -/
+def cpiAccountWritable (proposedMem : UInt64 → UInt8) (info : CpiAccountInfo) (a : UInt64) : Bool :=
+  if !info.isWritable then false
+  else
+    let newLen := memReadU64 proposedMem (info.infoPtr + 16)
+    let maxLen :=
+      if newLen > info.dataLen then
+        if newLen ≤ info.dataLen + 10240 then newLen else info.dataLen + 10240
+      else info.dataLen
+    (a - info.lamportsPtr < 8) ||
+    (a - info.ownerPtr < 32) ||
+    (a - (info.infoPtr + 16) < 8) ||
+    (a - (info.lamportsPtr + 8) < 8) ||
+    (a - info.dataPtr < maxLen)
+
+/-- Returns `true` iff address `a` lies within a writable account passed in `infos`. -/
+def cpiAddrWritable (proposedMem : UInt64 → UInt8) (infos : List CpiAccountInfo) (a : UInt64) : Bool :=
+  infos.any (cpiAccountWritable proposedMem · a)
+
+/-- Built-in Agave-faithful CPI handler for canonical Solana programs:
+    - **System Program** (`1111...1111`): `Transfer` (op 2), `Allocate` (op 8), `Assign` (op 1)
+    - **SPL Token** (`Tokenkeg...`) & **SPL Token-2022** (`TokenzQd...`):
+      `TransferChecked` (op 12), `MintTo` (op 7), `Burn` (op 8), `InitializeAccount3` (op 18)
+    Returns `(1, mem)` for unknown programs or failed precondition checks.
+    Note: Universal proofs over `∀ s : SvmState` quantify over arbitrary `s.cpiHandler`, so
+    proving unsound "CPI leaves writable accounts unchanged" theorems is impossible! -/
+def defaultCpiHandler (mem : UInt64 → UInt8) (inv : CpiInvocation) : UInt64 × (UInt64 → UInt8) :=
+  let w0 := memReadU64 mem inv.progKeyPtr
+  let w1 := memReadU64 mem (inv.progKeyPtr + 8)
+  let w2 := memReadU64 mem (inv.progKeyPtr + 16)
+  let w3 := memReadU64 mem (inv.progKeyPtr + 24)
+  let isSystem := (w0 ||| w1 ||| w2 ||| w3) == 0
+  let isSplToken :=
+    (w0 == 0x93a165d7e1f6dd06 && w1 == 0xac79ebce46e1cbd9 &&
+     w2 == 0x91375b5fed85b41c && w3 == 0xa900ff7e85f58c3a) ||
+    (w0 == 0xde8f75eee1f6dd06 && w1 == 0xdacd6ce4bc5d4218 &&
+     w2 == 0x270db9834dfc1ab6 && w3 == 0xfc8ba1d828f9bdfe)
+  if isSystem then
+    if inv.dataLen < 4 then (1, mem)
+    else
+      let op := memReadU32 mem inv.dataPtr
+      if op == 2 then
+        -- SystemProgram::Transfer(lamports: u64): [from(W), to(W)]
+        if inv.dataLen < 12 then (1, mem)
+        else match inv.infos with
+          | src :: dst :: _ =>
+            if !src.isWritable || !dst.isWritable then (1, mem)
+            else
+              let amt := memReadU64 mem (inv.dataPtr + 4)
+              let srcLam := memReadU64 mem src.lamportsPtr
+              if srcLam < amt then (1, mem)
+              else
+                let m1 := memWriteU64 mem src.lamportsPtr (srcLam - amt)
+                let dstLam := memReadU64 m1 dst.lamportsPtr
+                if dstLam + amt < dstLam then (1, mem)
+                else (0, memWriteU64 m1 dst.lamportsPtr (dstLam + amt))
+          | _ => (1, mem)
+      else if op == 8 then
+        -- SystemProgram::Allocate(space: u64): [acc(W)]
+        if inv.dataLen < 12 then (1, mem)
+        else match inv.infos with
+          | acc :: _ =>
+            let space := memReadU64 mem (inv.dataPtr + 4)
+            if !acc.isWritable || acc.dataLen != 0 || space > 10240 then (1, mem)
+            else
+              let m1 := memWriteU64 mem (acc.infoPtr + 16) space
+              let m2 := memWriteU64 m1 (acc.lamportsPtr + 8) space
+              (0, memZeroBytes m2 acc.dataPtr space.toNat)
+          | _ => (1, mem)
+      else if op == 1 then
+        -- SystemProgram::Assign(owner: Pubkey): [acc(W)]
+        if inv.dataLen < 36 then (1, mem)
+        else match inv.infos with
+          | acc :: _ =>
+            if !acc.isWritable then (1, mem)
+            else (0, memCopyBytes mem acc.ownerPtr (inv.dataPtr + 4) 32)
+          | _ => (1, mem)
+      else (1, mem)
+  else if isSplToken then
+    if inv.dataLen < 1 then (1, mem)
+    else
+      let op := mem inv.dataPtr
+      if op == 12 then
+        -- SPL Token / Token-2022 TransferChecked(amount: u64, decimals: u8): [src(W), mint, dst(W), auth]
+        if inv.dataLen < 10 then (1, mem)
+        else match inv.infos with
+          | src :: mint :: dst :: _ :: _ =>
+            let amt := memReadU64 mem (inv.dataPtr + 1)
+            let dec := mem (inv.dataPtr + 9)
+            let mintDec := mem (mint.dataPtr + 44)
+            if !src.isWritable || !dst.isWritable || mintDec != dec then (1, mem)
+            else
+              let srcAmt := memReadU64 mem (src.dataPtr + 64)
+              if srcAmt < amt then (1, mem)
+              else
+                let m1 := memWriteU64 mem (src.dataPtr + 64) (srcAmt - amt)
+                let dstAmt := memReadU64 m1 (dst.dataPtr + 64)
+                if dstAmt + amt < dstAmt then (1, mem)
+                else (0, memWriteU64 m1 (dst.dataPtr + 64) (dstAmt + amt))
+          | _ => (1, mem)
+      else if op == 7 then
+        -- SPL Token / Token-2022 MintTo(amount: u64): [mint(W), dst(W), auth]
+        if inv.dataLen < 9 then (1, mem)
+        else match inv.infos with
+          | mint :: dst :: _ :: _ =>
+            let amt := memReadU64 mem (inv.dataPtr + 1)
+            if !mint.isWritable || !dst.isWritable then (1, mem)
+            else
+              let sup := memReadU64 mem (mint.dataPtr + 36)
+              let dstAmt := memReadU64 mem (dst.dataPtr + 64)
+              if sup + amt < sup || dstAmt + amt < dstAmt then (1, mem)
+              else
+                let m1 := memWriteU64 mem (mint.dataPtr + 36) (sup + amt)
+                (0, memWriteU64 m1 (dst.dataPtr + 64) (dstAmt + amt))
+          | _ => (1, mem)
+      else if op == 8 then
+        -- SPL Token / Token-2022 Burn(amount: u64): [src(W), mint(W), auth]
+        if inv.dataLen < 9 then (1, mem)
+        else match inv.infos with
+          | src :: mint :: _ :: _ =>
+            let amt := memReadU64 mem (inv.dataPtr + 1)
+            if !src.isWritable || !mint.isWritable then (1, mem)
+            else
+              let srcAmt := memReadU64 mem (src.dataPtr + 64)
+              let sup := memReadU64 mem (mint.dataPtr + 36)
+              if srcAmt < amt || sup < amt then (1, mem)
+              else
+                let m1 := memWriteU64 mem (src.dataPtr + 64) (srcAmt - amt)
+                (0, memWriteU64 m1 (mint.dataPtr + 36) (sup - amt))
+          | _ => (1, mem)
+      else if op == 18 then
+        -- SPL Token / Token-2022 InitializeAccount3(owner: Pubkey): [acc(W), mint]
+        if inv.dataLen < 33 then (1, mem)
+        else match inv.infos with
+          | acc :: mint :: _ =>
+            if !acc.isWritable then (1, mem)
+            else
+              let m1 := memCopyBytes mem acc.dataPtr mint.keyPtr 32
+              let m2 := memCopyBytes m1 (acc.dataPtr + 32) (inv.dataPtr + 1) 32
+              let m3 := memWriteU64 m2 (acc.dataPtr + 64) 0
+              (0, memWriteU8 m3 (acc.dataPtr + 108) 1)
+          | _ => (1, mem)
+      else (1, mem)
+  else (1, mem)
 
 /-- Pure functional model of the Solana Virtual Machine state for kernel-checked proofs. -/
 structure SvmState where
@@ -21,7 +259,7 @@ structure SvmState where
   logs    : List String := []
   /-- Next available stack buffer address (grows downward from `0x200001000`). -/
   stackSp : UInt64 := 0x200001000
-  /-- Mock clock slot (used by `sysClock` in pure Lean proofs). -/
+  /-- Mock clock slot (used by `sysGetClock` in pure Lean proofs). -/
   slot                : UInt64 := 0
   /-- Mock clock epoch start timestamp (signed i64 bit pattern). -/
   epochStartTimestamp : UInt64 := 0
@@ -31,6 +269,9 @@ structure SvmState where
   leaderScheduleEpoch : UInt64 := 0
   /-- Mock clock Unix timestamp (signed i64 bit pattern). -/
   unixTimestamp       : UInt64 := 0
+  /-- Pluggable CPI callee semantics `(mem, inv) ↦ (rc, proposedMem)` constrained by
+      Agave's writable-account writeback boundary in `sysInvokeSignedC`. -/
+  cpiHandler : (UInt64 → UInt8) → CpiInvocation → UInt64 × (UInt64 → UInt8) := defaultCpiHandler
 
 namespace SvmState
 
@@ -340,11 +581,159 @@ theorem SvmState.memcmpLoop_eq_zero_iff (s : SvmState) (a b : UInt64) (n : Nat) 
 @[noinline] def sysMemcmp (a b len resultPtr : UInt64) (s : SvmState) : SvmStep Unit :=
   .ok () (s.writeU32 resultPtr (s.memcmpLoop a b len.toNat 0))
 
-/-- Compute SHA-256 over `valsLen` `(ptr, len)` slice descriptors at `valsPtr`,
-    writing 32-byte digest into `resultPtr`, via `sol_sha256`. -/
+/-- Read `n` consecutive bytes starting at `addr`. -/
+def SvmState.readBytes (s : SvmState) (addr : UInt64) : Nat → List UInt8
+  | 0 => []
+  | k + 1 => s.readU8 addr :: s.readBytes (addr + 1) k
+
+/-- Write a byte list sequentially starting at `addr`. -/
+def SvmState.writeBytes (s : SvmState) (addr : UInt64) : List UInt8 → SvmState
+  | [] => s
+  | b :: bs => (s.writeU8 addr b).writeBytes (addr + 1) bs
+
+/-- Read and concatenate `n` Solana `SolBytes` slice descriptors `(ptr: u64, len: u64)` at `valsPtr`. -/
+def SvmState.readSliceVec (s : SvmState) (valsPtr : UInt64) : Nat → List UInt8
+  | 0 => []
+  | k + 1 =>
+    let ptr := s.readU64 valsPtr
+    let len := s.readU64 (valsPtr + 8)
+    s.readBytes ptr len.toNat ++ s.readSliceVec (valsPtr + 16) k
+
+theorem SvmState.writeBytes_mem_outside (s : SvmState) (addr : UInt64) (bs : List UInt8) (x : UInt64)
+    (hnoWrap : addr.toNat + bs.length ≤ 2 ^ 64)
+    (hout : x.toNat < addr.toNat ∨ addr.toNat + bs.length ≤ x.toNat) :
+    (s.writeBytes addr bs).mem x = s.mem x := by
+  induction bs generalizing s addr with
+  | nil => rfl
+  | cons b rest ih =>
+    simp only [SvmState.writeBytes, List.length_cons] at hnoWrap hout ⊢
+    have hltMax : addr.toNat + 1 < 2 ^ 64 ∨ addr.toNat + 1 = 2 ^ 64 := by omega
+    have hneq : x ≠ addr := by
+      intro h; subst h; omega
+    have hbeq : (x == addr) = false := beq_false_of_ne hneq
+    cases rest with
+    | nil =>
+      simp [SvmState.writeBytes, SvmState.writeU8, hneq]
+    | cons b2 rest2 =>
+      have h1 : (addr + 1).toNat = addr.toNat + 1 := by
+        rw [UInt64.toNat_add]
+        have : (1 : UInt64).toNat = 1 := rfl
+        rw [this, Nat.mod_eq_of_lt (by simp at hnoWrap; omega)]
+      have hnoWrap' : (addr + 1).toNat + (b2 :: rest2).length ≤ 2 ^ 64 := by
+        rw [h1]; simp at hnoWrap ⊢; omega
+      have hout' : x.toNat < (addr + 1).toNat ∨ (addr + 1).toNat + (b2 :: rest2).length ≤ x.toNat := by
+        rw [h1]; simp at hout ⊢; omega
+      rw [ih (s.writeU8 addr b) (addr + 1) hnoWrap' hout']
+      simp [SvmState.writeU8, hneq]
+
+theorem SvmState.readBytes_writeBytes_same (s : SvmState) (addr : UInt64) (bs : List UInt8)
+    (hnoWrap : addr.toNat + bs.length ≤ 2 ^ 64) :
+    (s.writeBytes addr bs).readBytes addr bs.length = bs := by
+  induction bs generalizing s addr with
+  | nil => rfl
+  | cons b rest ih =>
+    simp only [SvmState.writeBytes, SvmState.readBytes, List.length_cons] at hnoWrap ⊢
+    cases rest with
+    | nil =>
+      simp [SvmState.writeBytes, SvmState.readBytes, SvmState.readU8, SvmState.writeU8]
+    | cons b2 rest2 =>
+      have h1 : (addr + 1).toNat = addr.toNat + 1 := by
+        rw [UInt64.toNat_add]
+        have : (1 : UInt64).toNat = 1 := rfl
+        rw [this, Nat.mod_eq_of_lt (by simp at hnoWrap; omega)]
+      have hnoWrap' : (addr + 1).toNat + (b2 :: rest2).length ≤ 2 ^ 64 := by
+        rw [h1]; simp at hnoWrap ⊢; omega
+      have hhead : ((s.writeU8 addr b).writeBytes (addr + 1) (b2 :: rest2)).readU8 addr = b := by
+        unfold SvmState.readU8
+        rw [SvmState.writeBytes_mem_outside (s.writeU8 addr b) (addr + 1) (b2 :: rest2) addr hnoWrap'
+              (Or.inl (by rw [h1]; omega))]
+        simp [SvmState.writeU8]
+      rw [hhead, ih (s.writeU8 addr b) (addr + 1) hnoWrap']
+
+/-- Compute byte-exact FIPS 180-4 SHA-256 over `valsLen` `(ptr, len)` slice descriptors at `valsPtr`,
+    writing all 32 digest bytes into `resultPtr`, via `sol_sha256`.
+    Returns error code `1` without mutating memory on null `resultPtr`, null `valsPtr` with
+    `valsLen > 0`, or `valsLen > 20000` (Agave `HASH_BYTES_MAX_SLICES`). -/
 @[noinline] def sysSha256 (valsPtr valsLen resultPtr : UInt64) (s : SvmState) : SvmStep UInt64 :=
-  let seed := s.readU64 valsPtr ^^^ valsLen
-  .ok (if valsLen == 0xFFFFFFFFFFFFFFFF then 1 else 0) (s.writeU64 resultPtr seed)
+  if resultPtr == 0 || (valsLen != 0 && valsPtr == 0) || valsLen > 20000 then
+    .ok 1 s
+  else
+    let msg := s.readSliceVec valsPtr valsLen.toNat
+    let digest := Sha256.hash msg
+    .ok 0 (s.writeBytes resultPtr digest)
+
+/-- **THEOREM (`sysSha256_spec` — Null-Safety, Exact 32-Byte FIPS 180-4 Digest & Frame)**:
+    1. Null `resultPtr = 0` returns `.ok 1 s` without mutating memory.
+    2. For valid non-wrapping `resultPtr` and `valsLen ≤ 20000`, `sysSha256` returns `.ok 0 s'`
+       where `s'.readBytes resultPtr 32 = Sha256.hash (s.readSliceVec valsPtr valsLen.toNat)`
+       and every byte outside `[resultPtr, resultPtr + 32)` is preserved unchanged! -/
+theorem sysSha256_spec (valsPtr valsLen resultPtr : UInt64) (s : SvmState) :
+    (resultPtr = 0 → sysSha256 valsPtr valsLen resultPtr s = .ok 1 s) ∧
+    (resultPtr ≠ 0 → (valsLen = 0 ∨ valsPtr ≠ 0) → valsLen ≤ 20000 →
+      resultPtr.toNat + 32 ≤ 2 ^ 64 →
+      ∃ s', sysSha256 valsPtr valsLen resultPtr s = .ok 0 s' ∧
+        s'.readBytes resultPtr 32 = Sha256.hash (s.readSliceVec valsPtr valsLen.toNat) ∧
+        ∀ x : UInt64, (x.toNat < resultPtr.toNat ∨ resultPtr.toNat + 32 ≤ x.toNat) →
+          s'.mem x = s.mem x) := by
+  constructor
+  · intro h0; subst h0; simp [sysSha256]
+  · intro hres hvp hlen hnoWrap
+    have hcond : (resultPtr == 0 || (valsLen != 0 && valsPtr == 0) || valsLen > 20000) = false := by
+      have h1 : (resultPtr == 0) = false := beq_false_of_ne hres
+      have h2 : (valsLen != 0 && valsPtr == 0) = false := by
+        rcases hvp with hv0 | hpn
+        · subst hv0; rfl
+        · simp [beq_false_of_ne hpn]
+      have h3 : decide (valsLen > 20000) = false :=
+        decide_eq_false (UInt64.not_lt.mpr hlen)
+      simp [h1, h2, h3]
+    unfold sysSha256
+    rw [hcond]; simp only [Bool.false_eq_true, ↓reduceIte]
+    refine ⟨_, rfl, ?_, ?_⟩
+    · have hlen32 : (Sha256.hash (s.readSliceVec valsPtr valsLen.toNat)).length = 32 :=
+        Sha256.hash_length _
+      have hnw : resultPtr.toNat + (Sha256.hash (s.readSliceVec valsPtr valsLen.toNat)).length ≤ 2 ^ 64 := by
+        rw [hlen32]; exact hnoWrap
+      have hrb := SvmState.readBytes_writeBytes_same s resultPtr
+        (Sha256.hash (s.readSliceVec valsPtr valsLen.toNat)) hnw
+      rwa [hlen32] at hrb
+    · intro x hout
+      have hlen32 : (Sha256.hash (s.readSliceVec valsPtr valsLen.toNat)).length = 32 :=
+        Sha256.hash_length _
+      exact SvmState.writeBytes_mem_outside s resultPtr _ x
+        (by rw [hlen32]; exact hnoWrap) (by rw [hlen32]; exact hout)
+
+set_option maxRecDepth 20000 in
+/-- **THEOREM (`sysSha256_multislice_and_distinct_same_ptr`)**:
+    Closes Issue #3 directly:
+    1. Hashing multi-slice `["ab", "c"]` through `sysSha256` produces all 32 bytes of NIST `SHA-256("abc")`.
+    2. Hashing two DIFFERENT byte payloads stored at the EXACT SAME pointer address produces
+       DIFFERENT 32-byte digests (no pointer-only collision, and bytes `8..32` are written!). -/
+theorem sysSha256_multislice_and_distinct_same_ptr :
+    let descPtr : UInt64 := 0x200000100
+    let dataA   : UInt64 := 0x200000200
+    let dataB   : UInt64 := 0x200000210
+    let outPtr  : UInt64 := 0x200000300
+    -- State 1: two slices ["ab", "c"]
+    let s1 : SvmState :=
+      ((((((SvmState.empty.writeBytes dataA [0x61, 0x62]).writeBytes dataB [0x63]).writeU64
+        descPtr dataA).writeU64 (descPtr + 8) 2).writeU64 (descPtr + 16) dataB).writeU64 (descPtr + 24) 1)
+    -- State 2: same slice pointer `dataA`, different bytes ["ab", "d"]!
+    let s2 : SvmState := s1.writeU8 dataB 0x64
+    (match sysSha256 descPtr 2 outPtr s1 with
+     | .ok 0 s1' =>
+       s1'.readBytes outPtr 32 ==
+         [0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+          0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+          0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+          0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad]
+     | _ => false) = true ∧
+    (match sysSha256 descPtr 2 outPtr s1, sysSha256 descPtr 2 outPtr s2 with
+     | .ok 0 s1', .ok 0 s2' =>
+       (s1'.readBytes outPtr 32 != s2'.readBytes outPtr 32) &&
+       (s1'.readU8 (outPtr + 31) == 0xad)
+     | _, _ => false) = true := by
+  exact ⟨rfl, rfl⟩
 
 /-- Read the Solana Clock sysvar (40 bytes: `slot`, `epoch_start_timestamp`, `epoch`,
     `leader_schedule_epoch`, `unix_timestamp`) into `outPtr` via `sol_get_clock_sysvar`.
@@ -396,11 +785,145 @@ theorem sysGetClock_spec (outPtr : UInt64) (s : SvmState) :
           SvmState.readU64_writeU64_same]
     · rw [SvmState.readU64_writeU64_same]
 
-/-- Cross-program invocation via `sol_invoke_signed_c`. -/
+/-- Cross-program invocation via `sol_invoke_signed_c`.
+    Decodes `SolInstruction` and all `infosLen` `SolAccountInfo` structs from `s.mem`,
+    invokes `s.cpiHandler`, and commits memory updates strictly within Agave's
+    writable-account writeback boundary (`cpiAddrWritable`). -/
 @[noinline] def sysInvokeSignedC (ixPtr infosPtr infosLen seedsPtr seedsLen : UInt64)
     (s : SvmState) : SvmStep UInt64 :=
-  let tag := ixPtr ^^^ infosPtr ^^^ infosLen ^^^ seedsPtr ^^^ seedsLen
-  .ok (if tag == 0xFFFFFFFFFFFFFFFF then 1 else 0) { s with logs := s.logs }
+  if ixPtr == 0 || (infosLen != 0 && infosPtr == 0) || infosLen > 255 then
+    .ok 1 s
+  else
+    let inv := decodeCpiInvocation s.mem ixPtr infosPtr infosLen seedsPtr seedsLen
+    let (rc, proposedMem) := s.cpiHandler s.mem inv
+    if rc != 0 then
+      .ok rc s
+    else
+      .ok 0 { s with mem := fun a =>
+        if cpiAddrWritable proposedMem inv.infos a then proposedMem a else s.mem a }
+
+/-- **THEOREM (`sysInvokeSignedC_preserves_non_writable` — Universal Agave Write-Protection Frame)**:
+    For ANY `s : SvmState` (quantified over ALL possible `s.cpiHandler` callees — even adversarial
+    unknown programs!), if `sysInvokeSignedC` succeeds with `(rc, s')`, then:
+    - If `rc ≠ 0`, `s' = s` (failed CPI mutates nothing).
+    - If `rc = 0`, EVERY address `a` outside the writable `SolAccountInfo` fields (read-only
+      accounts, stack buffers, and non-CPI accounts) satisfies `s'.mem a = s.mem a`! -/
+theorem sysInvokeSignedC_preserves_non_writable
+    (ixPtr infosPtr infosLen seedsPtr seedsLen : UInt64) (s s' : SvmState) (rc : UInt64)
+    (hstep : sysInvokeSignedC ixPtr infosPtr infosLen seedsPtr seedsLen s = .ok rc s') :
+    (rc ≠ 0 → s' = s) ∧
+    (∀ a : UInt64,
+      let inv := decodeCpiInvocation s.mem ixPtr infosPtr infosLen seedsPtr seedsLen
+      let proposedMem := (s.cpiHandler s.mem inv).2
+      cpiAddrWritable proposedMem inv.infos a = false →
+      s'.mem a = s.mem a) := by
+  unfold sysInvokeSignedC at hstep
+  split at hstep
+  · cases hstep
+    exact ⟨fun _ => rfl, fun _ _ => rfl⟩
+  · dsimp only at hstep
+    split at hstep
+    · cases hstep
+      exact ⟨fun _ => rfl, fun _ _ => rfl⟩
+    · cases hstep
+      constructor
+      · intro hne; exact absurd rfl hne
+      · intro a inv proposedMem hnw
+        dsimp only at hnw ⊢
+        rw [hnw]
+        rfl
+
+/-- **THEOREM (`sysInvokeSignedC_readonly_account_preserved`)**:
+    Corollary of `sysInvokeSignedC_preserves_non_writable`: if EVERY `SolAccountInfo` in a CPI
+    call has `isWritable = false`, then `s'.mem = s.mem` for ALL `cpiHandler`s. -/
+theorem sysInvokeSignedC_readonly_account_preserved
+    (ixPtr infosPtr infosLen seedsPtr seedsLen : UInt64) (s s' : SvmState) (rc : UInt64)
+    (hstep : sysInvokeSignedC ixPtr infosPtr infosLen seedsPtr seedsLen s = .ok rc s')
+    (hro : ∀ info ∈ (decodeCpiInvocation s.mem ixPtr infosPtr infosLen seedsPtr seedsLen).infos,
+      info.isWritable = false) :
+    ∀ a : UInt64, s'.mem a = s.mem a := by
+  intro a
+  have hframe := (sysInvokeSignedC_preserves_non_writable ixPtr infosPtr infosLen seedsPtr seedsLen s s' rc hstep).2 a
+  apply hframe
+  unfold cpiAddrWritable
+  rw [List.any_eq_false]
+  intro info hmem
+  simp [cpiAccountWritable, hro info hmem]
+
+set_option maxRecDepth 20000 in
+/-- **THEOREM (`sysInvokeSignedC_spl_transfer_mutates_balances`)**:
+    Closes Issue #4 directly: under `defaultCpiHandler`, an SPL Token `TransferChecked` CPI
+    of `300` tokens from `src` (balance `1000`) to `dst` (balance `50`) genuinely mutates
+    `src.data[64..72]` to `700` and `dst.data[64..72]` to `350` while preserving read-only `mint`!
+    Therefore NO unsound Lean proof can claim `sysInvokeSignedC` leaves token balances unchanged! -/
+theorem sysInvokeSignedC_spl_transfer_mutates_balances :
+    let tokKeyPtr : UInt64 := 0x200000000
+    let ixPtr     : UInt64 := 0x200000040
+    let dataPtr   : UInt64 := 0x200000080
+    let infosPtr  : UInt64 := 0x200000100
+    let srcAcc    : UInt64 := 0x400000100
+    let mintAcc   : UInt64 := 0x400000300
+    let dstAcc    : UInt64 := 0x400000500
+    let authAcc   : UInt64 := 0x400000700
+    -- Write canonical SPL Token program ID at `tokKeyPtr`
+    let s0 := ((((SvmState.empty.writeU64 tokKeyPtr 0x93a165d7e1f6dd06).writeU64
+      (tokKeyPtr + 8) 0xac79ebce46e1cbd9).writeU64 (tokKeyPtr + 16) 0x91375b5fed85b41c).writeU64
+      (tokKeyPtr + 24) 0xa900ff7e85f58c3a)
+    -- Write SolInstruction `[tokKeyPtr, 0, 4, dataPtr, 10]` and TransferChecked `[12, 300u64, 6u8]`
+    let s1 := (((((s0.writeU64 ixPtr tokKeyPtr).writeU64 (ixPtr + 16) 4).writeU64
+      (ixPtr + 24) dataPtr).writeU64 (ixPtr + 32) 10).writeU8 dataPtr 12)
+    let s2 := ((s1.writeU64 (dataPtr + 1) 300).writeU8 (dataPtr + 9) 6)
+    -- Initialize account data: src amount = 1000, mint decimals = 6, dst amount = 50
+    let s3 := (((s2.writeU64 (srcAcc + 88 + 64) 1000).writeU8 (mintAcc + 88 + 44) 6).writeU64
+      (dstAcc + 88 + 64) 50)
+    -- Helper to write one 56B SolAccountInfo (dataLen = 165, isWritable = w)
+    let writeInfo (st : SvmState) (ip acc : UInt64) (w : UInt8) : SvmState :=
+      ((((((st.writeU64 ip (acc + 8)).writeU64 (ip + 8) (acc + 72)).writeU64 (ip + 16) 165).writeU64
+        (ip + 24) (acc + 88)).writeU64 (ip + 32) (acc + 40)).writeU8 (ip + 49) w)
+    let s4 := writeInfo (writeInfo (writeInfo (writeInfo s3 infosPtr srcAcc 1)
+      (infosPtr + 56) mintAcc 0) (infosPtr + 112) dstAcc 1) (infosPtr + 168) authAcc 0
+    (match sysInvokeSignedC ixPtr infosPtr 4 0 0 s4 with
+    | .ok 0 s' =>
+      (s'.readU64 (srcAcc + 88 + 64) == 700) &&
+      (s'.readU64 (dstAcc + 88 + 64) == 350) &&
+      (s'.readU8 (mintAcc + 88 + 44) == 6)
+    | _ => false) = true := by
+  rfl
+
+set_option maxRecDepth 20000 in
+/-- **THEOREM (`sysInvokeSignedC_system_allocate_and_assign`)**:
+    Under `defaultCpiHandler`, `SystemProgram::Allocate` updates `data_len` at BOTH
+    `SolAccountInfo+16` and `AccountView+80` (zeroing newly allocated bytes), and
+    `SystemProgram::Assign` updates the 32-byte `owner` at `acc+40`! -/
+theorem sysInvokeSignedC_system_allocate_and_assign :
+    let sysKeyPtr : UInt64 := 0x200000000 -- 32 zero bytes = System Program
+    let ixPtr     : UInt64 := 0x200000040
+    let dataPtr   : UInt64 := 0x200000080
+    let infosPtr  : UInt64 := 0x200000100
+    let pdaAcc    : UInt64 := 0x400000200
+    -- Write dirty byte at pdaAcc.data[0] to confirm Allocate zeroes it
+    let s0 := SvmState.empty.writeU8 (pdaAcc + 88) 0xAB
+    -- Write SolAccountInfo for pdaAcc (dataLen = 0, writable = 1)
+    let s1 := (((((s0.writeU64 infosPtr (pdaAcc + 8)).writeU64 (infosPtr + 8) (pdaAcc + 72)).writeU64
+      (infosPtr + 16) 0).writeU64 (infosPtr + 24) (pdaAcc + 88)).writeU64 (infosPtr + 32) (pdaAcc + 40)).writeU8
+      (infosPtr + 49) 1
+    -- Allocate(space = 64): ixData = [8u32, 64u64] (12 bytes)
+    let sAlloc := (((((s1.writeU64 ixPtr sysKeyPtr).writeU64 (ixPtr + 16) 1).writeU64
+      (ixPtr + 24) dataPtr).writeU64 (ixPtr + 32) 12).writeU32 dataPtr 8).writeU64 (dataPtr + 4) 64
+    (match sysInvokeSignedC ixPtr infosPtr 1 0 0 sAlloc with
+    | .ok 0 sAfterAlloc =>
+      -- Assign(newOwner = 0x1122334455667788 at word 0): ixData = [1u32, newOwner32] (36 bytes)
+      let sAssign := (((sAfterAlloc.writeU64 (ixPtr + 32) 36).writeU32 dataPtr 1).writeU64
+        (dataPtr + 4) 0x1122334455667788)
+      match sysInvokeSignedC ixPtr infosPtr 1 0 0 sAssign with
+      | .ok 0 sFinal =>
+        (sAfterAlloc.readU64 (infosPtr + 16) == 64) &&
+        (sAfterAlloc.readU64 (pdaAcc + 80) == 64) &&
+        (sAfterAlloc.readU8 (pdaAcc + 88) == 0) &&
+        (sFinal.readU64 (pdaAcc + 40) == 0x1122334455667788)
+      | _ => false
+    | _ => false) = true := by
+  rfl
 
 /-! ### Ergonomic `SolanaM` Wrappers -/
 
