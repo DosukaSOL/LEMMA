@@ -910,7 +910,8 @@ partial def lowerCode
     (envMap : Std.HashMap FVarId Val)
     (jpMap : Std.HashMap FVarId JpInfo)
     (onReturn : Val → LowerM Unit)
-    (fuel : Nat := 128) : LowerM Unit := do
+    (fuel : Nat := 128)
+    (isDirectEntryRet : Bool := false) : LowerM Unit := do
   if fuel == 0 then
     throw "inlining/lowering fuel exhausted (possible unbounded non-tail recursion)"
   let env := (← get).env
@@ -1135,9 +1136,9 @@ partial def lowerCode
                           setTerm (.jmp lBlk hValRegs)
                           switchBlock lBlk
                           modify fun st => { st with activeRecLoops := [(declName, lBlk, loopParams, hKinds)] }
-                          lowerCode calleeBody loopEnv {} helperRet (fuel - 1)
+                          lowerCode calleeBody loopEnv {} helperRet (fuel - 1) isSvmUnit
                         else
-                          lowerCode calleeBody hEnv {} helperRet (fuel - 1)
+                          lowerCode calleeBody hEnv {} helperRet (fuel - 1) isSvmUnit
                         let hSt ← get
                         let helperFunc : Func := {
                           name := declName.toString
@@ -1191,19 +1192,19 @@ partial def lowerCode
                       setTerm (.brCmpImm .eq resReg 0 okBlk #[] errBlk #[])
                       switchBlock errBlk
                       let envErr := envMap.insert decl.fvarId (.ctorVal 1 #[.reg resReg, .erased])
-                      lowerCode k envErr jpMap onReturn fuel
+                      lowerCode k envErr jpMap onReturn fuel isDirectEntryRet
                       switchBlock okBlk
                       let valReg ← freshVReg
                       emit (.loadStack .b8 valReg outSlotOff)
                       let envOk := envMap.insert decl.fvarId (.ctorVal 0 #[.reg valReg, .erased])
-                      lowerCode k envOk jpMap onReturn fuel
+                      lowerCode k envOk jpMap onReturn fuel isDirectEntryRet
                       return ()
                     else
                     let resReg ← freshVReg
                     emit (.call (some resReg) fnLabel passArgs)
                     if isSvmUnit then
                       let isTailRet := match k with | .return retFid => retFid == decl.fvarId | _ => false
-                      if isTailRet then
+                      if isTailRet && isDirectEntryRet then
                         setTerm (.ret resReg)
                         return ()
                       else
@@ -1212,10 +1213,10 @@ partial def lowerCode
                         setTerm (.brCmpImm .eq resReg 0 okBlk #[] errBlk #[])
                         switchBlock errBlk
                         let envErr := envMap.insert decl.fvarId (.ctorVal 1 #[.reg resReg, .erased])
-                        lowerCode k envErr jpMap onReturn fuel
+                        lowerCode k envErr jpMap onReturn fuel isDirectEntryRet
                         switchBlock okBlk
                         let envOk := envMap.insert decl.fvarId (.ctorVal 0 #[.erased, .erased])
-                        lowerCode k envOk jpMap onReturn fuel
+                        lowerCode k envOk jpMap onReturn fuel isDirectEntryRet
                         return ()
                     else if isInfallibleSvm then
                       pure (.ctorVal 0 #[.reg resReg, .erased])
@@ -1250,7 +1251,7 @@ partial def lowerCode
                     modify fun st => { st with activeRecLoops := (declName, loopBlk, pRegs, pKinds) :: st.activeRecLoops }
                     let isDirectTailRet := match k with | .return retFid => retFid == decl.fvarId | _ => false
                     if isDirectTailRet then
-                      lowerCode calleeBody calleeEnv {} onReturn (fuel - 1)
+                      lowerCode calleeBody calleeEnv {} onReturn (fuel - 1) isDirectEntryRet
                       modify fun st => { st with activeRecLoops := st.activeRecLoops.tail! }
                       return ()
                     else
@@ -1270,7 +1271,7 @@ partial def lowerCode
                         | other =>
                           let tReg ← emitConst 0
                           let pReg ← valToReg other
-                          setTerm (.jmp afterBlk #[tReg, pReg])) (fuel - 1)
+                          setTerm (.jmp afterBlk #[tReg, pReg])) (fuel - 1) false
                       modify fun st => { st with activeRecLoops := st.activeRecLoops.tail! }
                       switchBlock afterBlk
                       -- Peel forall binders to inspect actual return type (e.g. `Ptr → UInt64 → SvmState → SvmStep Ptr`)
@@ -1285,7 +1286,7 @@ partial def lowerCode
                         else
                           .reg payReg
                       let envMap' := envMap.insert decl.fvarId retVal
-                      lowerCode k envMap' jpMap onReturn (fuel - 1)
+                      lowerCode k envMap' jpMap onReturn (fuel - 1) isDirectEntryRet
                       return ()
                   else
                     -- Non-recursive helper: inline with join-point continuation (prevents O(2^N) code blowup!)
@@ -1295,7 +1296,7 @@ partial def lowerCode
                       calleeEnv := calleeEnv.insert p.fvarId (argVals.getD idx .erased)
                     let isTailRet := match k with | .return retFid => retFid == decl.fvarId | _ => false
                     if isTailRet then
-                      lowerCode calleeBody calleeEnv {} onReturn (fuel - 1)
+                      lowerCode calleeBody calleeEnv {} onReturn (fuel - 1) isDirectEntryRet
                       return ()
                     else if isSvmStepScalarOrUnitType calleeDecl.type then
                       -- Join all return paths of `calleeBody` into a single `afterBlk(tagReg, payReg)`
@@ -1315,33 +1316,33 @@ partial def lowerCode
                         | other =>
                           let tReg ← emitConst 0
                           let pReg ← valToReg other
-                          setTerm (.jmp afterBlk #[tReg, pReg])) (fuel - 1)
+                          setTerm (.jmp afterBlk #[tReg, pReg])) (fuel - 1) false
                       switchBlock afterBlk
                       let envMap' := envMap.insert decl.fvarId (.dynCtor tagReg #[payReg])
-                      lowerCode k envMap' jpMap onReturn fuel
+                      lowerCode k envMap' jpMap onReturn fuel isDirectEntryRet
                       return ()
                     else if isScalarType calleeDecl.type && codeSize calleeBody > 4 then
                       let resReg ← freshVReg
                       let afterBlk ← newBlock #[resReg]
                       lowerCode calleeBody calleeEnv {} (fun rv => do
                         let r ← valToReg rv
-                        setTerm (.jmp afterBlk #[r])) (fuel - 1)
+                        setTerm (.jmp afterBlk #[r])) (fuel - 1) false
                       switchBlock afterBlk
                       let envMap' := envMap.insert decl.fvarId (.reg resReg)
-                      lowerCode k envMap' jpMap onReturn fuel
+                      lowerCode k envMap' jpMap onReturn fuel isDirectEntryRet
                       return ()
                     else
                       -- Compound struct-returning helper (e.g. `Input.parse*`): CPS inline so SROA eliminates struct!
                       lowerCode calleeBody calleeEnv {} (fun rv => do
                         let envMap' := envMap.insert decl.fvarId rv
-                        lowerCode k envMap' jpMap onReturn fuel) (fuel - 1)
+                        lowerCode k envMap' jpMap onReturn fuel isDirectEntryRet) (fuel - 1) false
                       return ()
                 | .extern _ =>
                   throw s!"unsupported external Lean declaration in sBPF program: {declName}"
               | none =>
                 throw s!"declaration not found in LCNF environment: {declName}"
     let envMap' := envMap.insert decl.fvarId val
-    lowerCode k envMap' jpMap onReturn fuel
+    lowerCode k envMap' jpMap onReturn fuel isDirectEntryRet
 
   | .fun _ _ _ =>
     throw "local closures (`Code.fun`) are not supported in zero-allocation sBPF; mark helpers `@[inline]` or top-level"
@@ -1363,10 +1364,10 @@ partial def lowerCode
     let jpBlk ← newBlock pRegs
     let jpMap' := jpMap.insert jpDecl.fvarId { blockId := jpBlk, paramRegs := pRegs, paramKind := pKinds }
     -- Lower `k` first so all incoming `jmp jpBlk args` edges exist before lowering `jpDecl.value`!
-    lowerCode k envMap jpMap' onReturn (fuel - 1)
+    lowerCode k envMap jpMap' onReturn (fuel - 1) isDirectEntryRet
     let savedBlk := (← get).curBlock
     switchBlock jpBlk
-    lowerCode jpDecl.value jpEnv jpMap onReturn (fuel - 1)
+    lowerCode jpDecl.value jpEnv jpMap onReturn (fuel - 1) isDirectEntryRet
     switchBlock savedBlk
 
   | .jmp fid args =>
@@ -1389,11 +1390,11 @@ partial def lowerCode
         let mut e := envMap
         for idx in [0:params.size] do
           e := e.insert params[idx]!.fvarId (fields.getD idx .erased)
-        lowerCode body e jpMap onReturn (fuel - 1)
+        lowerCode body e jpMap onReturn (fuel - 1) isDirectEntryRet
       | .default body =>
-        lowerCode body envMap jpMap onReturn (fuel - 1)
+        lowerCode body envMap jpMap onReturn (fuel - 1) isDirectEntryRet
       | .ctorAlt _ body _ =>
-        lowerCode body envMap jpMap onReturn (fuel - 1)
+        lowerCode body envMap jpMap onReturn (fuel - 1) isDirectEntryRet
 
     match discrVal with
     -- Case 1: Compile-time known constructor (ZERO instructions emitted! Folded completely!)
@@ -1418,15 +1419,15 @@ partial def lowerCode
     -- Case 3: Dynamic tagged constructor (e.g. `SvmStep` returned from a loop!)
     | .dynCtor tagReg payloads =>
       let fields := payloads.map Val.reg
-      lowerSwitch tagReg fields cs.alts envMap jpMap onReturn (fuel - 1)
+      lowerSwitch tagReg fields cs.alts envMap jpMap onReturn (fuel - 1) isDirectEntryRet
 
     -- Case 4: Dynamic scalar (`Bool`, `UInt8/64`, enum tag)
     | .reg tagReg =>
-      lowerSwitch tagReg #[] cs.alts envMap jpMap onReturn (fuel - 1)
+      lowerSwitch tagReg #[] cs.alts envMap jpMap onReturn (fuel - 1) isDirectEntryRet
 
     | .natLit n =>
       let r ← emitConst n.toUInt64
-      lowerSwitch r #[] cs.alts envMap jpMap onReturn (fuel - 1)
+      lowerSwitch r #[] cs.alts envMap jpMap onReturn (fuel - 1) isDirectEntryRet
 
     | .erased =>
       if cs.alts.size > 0 then lowerAlt cs.alts[0]! #[]
@@ -1455,7 +1456,7 @@ where
 
   lowerSwitch (tagReg : VReg) (fields : Array Val) (alts : Array (Alt .pure))
       (envMap : Std.HashMap FVarId Val) (jpMap : Std.HashMap FVarId JpInfo)
-      (onReturn : Val → LowerM Unit) (fuel : Nat) : LowerM Unit := do
+      (onReturn : Val → LowerM Unit) (fuel : Nat) (isDirectEntryRet : Bool) : LowerM Unit := do
     let env := (← get).env
     -- Separate explicit constructor alternatives from optional default
     let mut explicit : Array (Nat × Alt .pure) := #[]
@@ -1474,9 +1475,9 @@ where
           for idx in [0:params.size] do
             m := m.insert params[idx]!.fvarId (fields.getD idx .erased)
           return m
-        lowerCode body e jpMap onReturn fuel
+        lowerCode body e jpMap onReturn fuel isDirectEntryRet
       | .default body | .ctorAlt _ body _ =>
-        lowerCode body envMap jpMap onReturn fuel
+        lowerCode body envMap jpMap onReturn fuel isDirectEntryRet
 
     if explicit.isEmpty then
       match default? with
@@ -1557,7 +1558,7 @@ def lowerEntrypoint (env : Environment) (entryName : Name) : Except String Progr
         envMap := envMap.insert p.fvarId .erased
       else
         throw s!"Solana entrypoint '{entryName}' has unexpected extra parameter '{p.binderName}' (expected `(input : Ptr) : SolanaM Unit` or `(input : Ptr) : UInt64`)"
-    lowerCode body envMap {} lowerEntryReturn 100000
+    lowerCode body envMap {} lowerEntryReturn 100000 true
     let st ← get
     return {
       name := entryName.toString
