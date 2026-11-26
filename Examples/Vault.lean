@@ -28,18 +28,22 @@ namespace Examples.Vault
   AccountView.setLamports toAcc newTo
 
 def entrypoint (input : Ptr) : SolanaM Unit := do
-  let (authority, fromVault, toDest, ix, _progId) ← Input.parse3 input
+  let (authority, fromVault, toDest, ix, progId) ← Input.parse3 input
   -- 1. Authority must sign
   let signed ← AccountView.isSigner authority
   SolanaM.require signed Err.missingRequiredSignature
-  -- 2. Vault and destination must be writable
+  -- 2. Vault and destination must be writable, distinct, and vault must be owned by this program
   let fromW ← AccountView.isWritable fromVault
   SolanaM.require fromW Err.invalidAccountData
   let toW ← AccountView.isWritable toDest
   SolanaM.require toW Err.invalidAccountData
-  -- 3. Vault must store 32-byte authority pubkey in data[0..32]
+  let owned ← pubkeyEq (AccountView.ownerPtr fromVault) progId
+  SolanaM.require owned Err.illegalOwner
+  let sameAcc ← pubkeyEq (AccountView.keyPtr fromVault) (AccountView.keyPtr toDest)
+  SolanaM.require (!sameAcc) Err.invalidArgument
+  -- 3. Vault must store exact 32-byte authority pubkey in data[0..32]
   let vLen ← AccountView.dataLen fromVault
-  SolanaM.require (vLen >= 32) Err.accountDataTooSmall
+  SolanaM.require (vLen == 32) Err.invalidAccountData
   let authOk ← pubkeyEq (AccountView.dataPtr fromVault) (AccountView.keyPtr authority)
   SolanaM.require authOk Err.illegalOwner
   -- 4. Instruction data must contain 8-byte u64 transfer amount

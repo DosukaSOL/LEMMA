@@ -56,12 +56,15 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
   let fee := (gross * feeBps) / 10000
   gross - fee
 
-@[noinline] private def handleInitCurve (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+private abbrev cSize : UInt64 := 96
+
+@[noinline] private def handleInitCurve (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 35) Err.invalidInstructionData
   let curve := a0
   let mint  ← AccountView.nextCursor curve
   SolanaM.require (← AccountView.isWritable curve) Err.invalidAccountData
-  SolanaM.require ((← AccountView.dataLen curve) >= 96) Err.accountDataTooSmall
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr curve) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen curve) == cSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 curve cInit) == 0) Err.accountAlreadyInitialized
 
   let bump   ← loadU8  ixPtr 1
@@ -72,6 +75,7 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
   let feeBps ← loadU64 ixPtr 27
   SolanaM.require (vSol > 0 && vTok > 0 && maxSup > 0 && feeBps <= 1000) Err.invalidArgument
 
+  zeroWords (AccountView.dataPtr curve) 0 (cSize >>> 3)
   AccountView.writeDataU8  curve cInit 1
   AccountView.writeDataU8  curve cBump bump
   AccountView.writeDataU8  curve cDec dec
@@ -84,7 +88,7 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
   AccountView.writeDataU64 curve cFeeBps feeBps
   AccountView.writeDataU64 curve cFees 0
 
-@[noinline] private def handleBuy (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def handleBuy (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 17) Err.invalidInstructionData
   let buyer    := a0
   let curve    ← AccountView.nextCursor buyer
@@ -96,8 +100,13 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
 
   SolanaM.require (← AccountView.isSigner buyer) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable curve) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr curve) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen curve) == cSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 curve cInit) == 1) Err.uninitializedAccount
+  checkTokenOr2022Prog tokProg
+  checkSystemProg sysProg
   SolanaM.require (← pubkeyEq (AccountView.dataPtr curve + cMint) (AccountView.keyPtr mint)) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr buyer) (AccountView.keyPtr curve))) Err.invalidArgument
 
   let lamportsIn   ← loadU64 ixPtr 1
   let minTokensOut ← loadU64 ixPtr 9
@@ -132,7 +141,7 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
   AccountView.writeDataU64 curve cSupply newSupply
   AccountView.writeDataU64 curve cFees newFees
 
-@[noinline] private def handleSell (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def handleSell (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 17) Err.invalidInstructionData
   let seller    := a0
   let curve     ← AccountView.nextCursor seller
@@ -143,8 +152,12 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
   SolanaM.require (← AccountView.isSigner seller) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable curve) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable seller) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr curve) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen curve) == cSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 curve cInit) == 1) Err.uninitializedAccount
+  checkTokenOr2022Prog tokProg
   SolanaM.require (← pubkeyEq (AccountView.dataPtr curve + cMint) (AccountView.keyPtr mint)) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr curve) (AccountView.keyPtr seller))) Err.invalidArgument
 
   let tokensIn       ← loadU64 ixPtr 1
   let minLamportsOut ← loadU64 ixPtr 9
@@ -181,18 +194,18 @@ def calcSellSol (vSol vTok tokensIn feeBps : Nat) : Nat :=
   AccountView.writeDataU64 curve cFees newFees
 
 def entrypoint (input : Ptr) : SolanaM Unit := do
-  let (n, a0, ix, _progId) ← Input.parseIxOnly input
+  let (n, a0, ix, progId) ← Input.parseIxOnly input
   SolanaM.require (ix.len >= 1) Err.invalidInstructionData
   let op ← loadU8 ix.ptr 0
   if op == 0 then
     SolanaM.require (n >= 2) Err.notEnoughAccountKeys
-    handleInitCurve a0 ix.ptr ix.len
+    handleInitCurve a0 progId ix.ptr ix.len
   else if op == 1 then
     SolanaM.require (n >= 7) Err.notEnoughAccountKeys
-    handleBuy a0 ix.ptr ix.len
+    handleBuy a0 progId ix.ptr ix.len
   else if op == 2 then
     SolanaM.require (n >= 5) Err.notEnoughAccountKeys
-    handleSell a0 ix.ptr ix.len
+    handleSell a0 progId ix.ptr ix.len
   else
     SolanaM.fail Err.invalidInstructionData
 

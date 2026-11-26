@@ -74,7 +74,9 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
   SolanaM.require (rc == 0) Err.unsupportedSysvar
   loadU64 buf 0
 
-@[noinline] private def handleCreate (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+private abbrev aSize     : UInt64 := 144
+
+@[noinline] private def handleCreate (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 35) Err.invalidInstructionData
   let seller    := a0
   let auction   ← AccountView.nextCursor seller
@@ -85,8 +87,11 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
 
   SolanaM.require (← AccountView.isSigner seller) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable auction) Err.invalidAccountData
-  SolanaM.require ((← AccountView.dataLen auction) >= 144) Err.accountDataTooSmall
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr auction) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen auction) == aSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 auction aStatus) == 0) Err.accountAlreadyInitialized
+  checkTokenOr2022Prog tokProg
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr sellerNft) (AccountView.keyPtr escrow))) Err.invalidArgument
 
   let bump     ← loadU8  ixPtr 1
   let dec      ← loadU8  ixPtr 2
@@ -98,6 +103,7 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
 
   tokenTransferChecked tokProg sellerNft nftMint escrow seller 1 dec
 
+  zeroWords (AccountView.dataPtr auction) 0 (aSize >>> 3)
   AccountView.writeDataU8  auction aStatus 1
   AccountView.writeDataU8  auction aBump bump
   AccountView.writeDataU8  auction aDec dec
@@ -110,7 +116,7 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
   AccountView.writeDataU64 auction aEndS endS
   AccountView.writeDataU64 auction aSettledP 0
 
-@[noinline] private def handleBuy (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def handleBuy (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 9) Err.invalidInstructionData
   let buyer    := a0
   let seller   ← AccountView.nextCursor buyer
@@ -124,10 +130,15 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
 
   SolanaM.require (← AccountView.isSigner buyer) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable auction) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr auction) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen auction) == aSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 auction aStatus) == 1) Err.invalidAccountData
+  checkTokenOr2022Prog tokProg
+  checkSystemProg sysProg
   SolanaM.require (← pubkeyEq (AccountView.dataPtr auction + aSeller) (AccountView.keyPtr seller)) Err.illegalOwner
   SolanaM.require (← pubkeyEq (AccountView.dataPtr auction + aMint)   (AccountView.keyPtr nftMint)) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.dataPtr auction + aEscrow) (AccountView.keyPtr escrow)) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr escrow) (AccountView.keyPtr buyerNft))) Err.invalidArgument
 
   let maxPrice ← loadU64 ixPtr 1
   let startP   ← AccountView.readDataU64 auction aStartP
@@ -147,7 +158,7 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
   AccountView.writeDataU8  auction aStatus 2
   AccountView.writeDataU64 auction aSettledP price
 
-@[noinline] private def handleCancel (a0 : AccountView) : SolanaM Unit := do
+@[noinline] private def handleCancel (a0 : AccountView) (progId : Ptr) : SolanaM Unit := do
   let seller    := a0
   let auction   ← AccountView.nextCursor seller
   let pdaAuth   ← AccountView.nextCursor auction
@@ -158,9 +169,14 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
 
   SolanaM.require (← AccountView.isSigner seller) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable auction) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr auction) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen auction) == aSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 auction aStatus) == 1) Err.invalidAccountData
+  checkTokenOr2022Prog tokProg
   SolanaM.require (← pubkeyEq (AccountView.dataPtr auction + aSeller) (AccountView.keyPtr seller)) Err.illegalOwner
+  SolanaM.require (← pubkeyEq (AccountView.dataPtr auction + aMint)   (AccountView.keyPtr nftMint)) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.dataPtr auction + aEscrow) (AccountView.keyPtr escrow)) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr escrow) (AccountView.keyPtr sellerNft))) Err.invalidArgument
 
   let bump ← AccountView.readDataU8 auction aBump
   let dec  ← AccountView.readDataU8 auction aDec
@@ -168,18 +184,18 @@ def dutchPriceNat (startP reserveP startS endS curS : Nat) : Nat :=
   AccountView.writeDataU8 auction aStatus 3
 
 def entrypoint (input : Ptr) : SolanaM Unit := do
-  let (n, a0, ix, _progId) ← Input.parseIxOnly input
+  let (n, a0, ix, progId) ← Input.parseIxOnly input
   SolanaM.require (ix.len >= 1) Err.invalidInstructionData
   let op ← loadU8 ix.ptr 0
   if op == 0 then
     SolanaM.require (n >= 6) Err.notEnoughAccountKeys
-    handleCreate a0 ix.ptr ix.len
+    handleCreate a0 progId ix.ptr ix.len
   else if op == 1 then
     SolanaM.require (n >= 9) Err.notEnoughAccountKeys
-    handleBuy a0 ix.ptr ix.len
+    handleBuy a0 progId ix.ptr ix.len
   else if op == 2 then
     SolanaM.require (n >= 7) Err.notEnoughAccountKeys
-    handleCancel a0
+    handleCancel a0 progId
   else
     SolanaM.fail Err.invalidInstructionData
 

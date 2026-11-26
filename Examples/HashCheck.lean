@@ -16,11 +16,13 @@ open LeanSVM
 namespace Examples.HashCheck
 
 def entrypoint (input : Ptr) : SolanaM Unit := do
-  let (stateAcc, ix, _progId) ← Input.parse1 input
+  let (stateAcc, ix, progId) ← Input.parse1 input
   let writable ← AccountView.isWritable stateAcc
   SolanaM.require writable Err.invalidAccountData
+  let owned ← pubkeyEq (AccountView.ownerPtr stateAcc) progId
+  SolanaM.require owned Err.illegalOwner
   let dlen ← AccountView.dataLen stateAcc
-  SolanaM.require (dlen >= 40) Err.accountDataTooSmall
+  SolanaM.require (dlen == 40) Err.invalidAccountData
 
   -- Allocate a 16-byte SolBytes slice descriptor `(ptr, len)` directly on the sBPF stack (0 heap!)
   let sliceDesc ← stackAlloc 16

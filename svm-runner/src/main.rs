@@ -722,6 +722,196 @@ fn test_bonding_curve() {
     );
 }
 
+/// Security regression tests across hardened examples:
+/// dirty-buffer init zeroing, wrong-owner rejection, exact dataLen enforcement,
+/// aliased/self-transfer rejection, and spoofed `noop.so` token/system program rejection!
+fn test_security_regressions() {
+    let noop_so = load_so("noop.so");
+    let lending_so = load_so("lending.so");
+    let vault_so = load_so("vault.so");
+    let counter_so = load_so("counter.so");
+
+    // 1. Lending: dirty obligation buffer (`oCol = 999_999_999`, `oDebt = 123_456`, `oMagic = 0`)
+    //    MUST be cleanly zeroed on first deposit, NOT added onto dirty `oCol`!
+    {
+        let mut svm = LiteSVM::new();
+        let payer = Keypair::new();
+        let borrower = Keypair::new();
+        let program_id = Address::new_unique();
+        let fake_tok_prog = Address::new_unique();
+        svm.add_program(program_id, &lending_so).unwrap();
+        svm.add_program(fake_tok_prog, &noop_so).unwrap();
+        svm.airdrop(&payer.pubkey(), 5_000_000_000).unwrap();
+
+        let market_addr = Address::new_unique();
+        let obl_addr = Address::new_unique();
+        let (pda_auth, bump) = Address::find_program_address(&[b"lend", market_addr.as_ref()], &program_id);
+        svm.set_account(market_addr, Account {
+            lamports: 10_000_000, data: vec![0u8; 128], owner: program_id, ..Default::default()
+        }).unwrap();
+        // Dirty 64-byte obligation buffer with huge residual oCol & oDebt (oMagic[56] == 0)
+        let mut dirty_obl = vec![0u8; 64];
+        dirty_obl[32..40].copy_from_slice(&999_999_999u64.to_le_bytes());
+        dirty_obl[40..48].copy_from_slice(&123_456u64.to_le_bytes());
+        svm.set_account(obl_addr, Account {
+            lamports: 10_000_000, data: dirty_obl, owner: program_id, ..Default::default()
+        }).unwrap();
+
+        let col_mint = create_mint(&mut svm, &payer, SPL_TOKEN_ID, payer.pubkey(), 6);
+        let debt_mint = create_mint(&mut svm, &payer, SPL_TOKEN_2022_ID, payer.pubkey(), 6);
+        let col_vault = create_token_account(&mut svm, &payer, SPL_TOKEN_ID, col_mint, pda_auth);
+        let debt_vault = create_token_account(&mut svm, &payer, SPL_TOKEN_2022_ID, debt_mint, pda_auth);
+        let bor_col = create_token_account(&mut svm, &payer, SPL_TOKEN_ID, col_mint, borrower.pubkey());
+        let bor_debt = create_token_account(&mut svm, &payer, SPL_TOKEN_2022_ID, debt_mint, borrower.pubkey());
+        mint_tokens(&mut svm, &payer, SPL_TOKEN_ID, col_mint, bor_col, &payer, 1_000_000);
+        mint_tokens(&mut svm, &payer, SPL_TOKEN_2022_ID, debt_mint, debt_vault, &payer, 5_000_000);
+
+        let mut init_data = vec![0u8, bump, 6, 6];
+        init_data.extend_from_slice(&7500u16.to_le_bytes());
+        init_data.extend_from_slice(&500u16.to_le_bytes());
+        init_data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        init_data.extend_from_slice(&2_000_000u64.to_le_bytes());
+        send_ix(&mut svm, &payer, &[], Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(market_addr, false),
+                AccountMeta::new_readonly(col_vault, false),
+                AccountMeta::new_readonly(debt_vault, false),
+            ],
+            data: init_data,
+        }).expect("InitMarket failed");
+
+        // Spoofed executable `noop.so` as token program MUST be rejected!
+        let mut dep_data = vec![1u8];
+        dep_data.extend_from_slice(&100_000u64.to_le_bytes());
+        assert!(send_ix(&mut svm, &payer, &[&borrower], Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(borrower.pubkey(), true),
+                AccountMeta::new(market_addr, false),
+                AccountMeta::new(obl_addr, false),
+                AccountMeta::new_readonly(col_mint, false),
+                AccountMeta::new(col_vault, false),
+                AccountMeta::new(bor_col, false),
+                AccountMeta::new_readonly(fake_tok_prog, false),
+            ],
+            data: dep_data.clone(),
+        }).is_err(), "Lending must reject spoofed noop.so token program");
+
+        // Deposit onto dirty 64B obligation MUST zero residual oCol & oDebt first!
+        send_ix(&mut svm, &payer, &[&borrower], Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(borrower.pubkey(), true),
+                AccountMeta::new(market_addr, false),
+                AccountMeta::new(obl_addr, false),
+                AccountMeta::new_readonly(col_mint, false),
+                AccountMeta::new(col_vault, false),
+                AccountMeta::new(bor_col, false),
+                AccountMeta::new_readonly(SPL_TOKEN_ID, false),
+            ],
+            data: dep_data,
+        }).expect("Deposit onto dirty obligation failed");
+        let od = svm.get_account(&obl_addr).unwrap().data;
+        assert_eq!(u64::from_le_bytes(od[32..40].try_into().unwrap()), 100_000, "dirty oCol must be zeroed");
+        assert_eq!(u64::from_le_bytes(od[40..48].try_into().unwrap()), 0, "dirty oDebt must be zeroed");
+        assert_eq!(od[56], 2, "oMagic must be set to MAGIC_OBL (2)");
+
+        // Fake non-program-owned obligation passed to Borrow MUST be rejected!
+        let fake_obl = Address::new_unique();
+        let mut fake_data = vec![0u8; 64];
+        fake_data[0..32].copy_from_slice(borrower.pubkey().as_ref());
+        fake_data[32..40].copy_from_slice(&999_999_999u64.to_le_bytes());
+        fake_data[56] = 2;
+        svm.set_account(fake_obl, Account {
+            lamports: 10_000_000, data: fake_data, owner: SYSTEM_PROGRAM_ID, ..Default::default()
+        }).unwrap();
+        let mut bor_data = vec![2u8];
+        bor_data.extend_from_slice(&50_000u64.to_le_bytes());
+        assert!(send_ix(&mut svm, &payer, &[&borrower], Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(borrower.pubkey(), true),
+                AccountMeta::new(market_addr, false),
+                AccountMeta::new_readonly(pda_auth, false),
+                AccountMeta::new(fake_obl, false),
+                AccountMeta::new_readonly(debt_mint, false),
+                AccountMeta::new(debt_vault, false),
+                AccountMeta::new(bor_debt, false),
+                AccountMeta::new_readonly(SPL_TOKEN_2022_ID, false),
+            ],
+            data: bor_data,
+        }).is_err(), "Lending Borrow must reject non-program-owned obligation");
+    }
+
+    // 2. Vault: self-transfer (fromVault == toDest) and wrong-owner vault MUST fail!
+    {
+        let mut svm = LiteSVM::new();
+        let payer = Keypair::new();
+        let auth = Keypair::new();
+        let vault_addr = Address::new_unique();
+        let wrong_owner_vault = Address::new_unique();
+        let dest_addr = Address::new_unique();
+        let program_id = Address::new_unique();
+        svm.add_program(program_id, &vault_so).unwrap();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(vault_addr, Account {
+            lamports: 10_000_000, data: auth.pubkey().to_bytes().to_vec(), owner: program_id, ..Default::default()
+        }).unwrap();
+        svm.set_account(wrong_owner_vault, Account {
+            lamports: 10_000_000, data: auth.pubkey().to_bytes().to_vec(), owner: SYSTEM_PROGRAM_ID, ..Default::default()
+        }).unwrap();
+        svm.set_account(dest_addr, Account {
+            lamports: 1_000_000, data: vec![], owner: SYSTEM_PROGRAM_ID, ..Default::default()
+        }).unwrap();
+
+        assert!(send_ix(&mut svm, &payer, &[&auth], Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(auth.pubkey(), true),
+                AccountMeta::new(vault_addr, false),
+                AccountMeta::new(vault_addr, false),
+            ],
+            data: 1_000_000u64.to_le_bytes().to_vec(),
+        }).is_err(), "Vault must reject self-transfer");
+
+        assert!(send_ix(&mut svm, &payer, &[&auth], Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(auth.pubkey(), true),
+                AccountMeta::new(wrong_owner_vault, false),
+                AccountMeta::new(dest_addr, false),
+            ],
+            data: 1_000_000u64.to_le_bytes().to_vec(),
+        }).is_err(), "Vault must reject non-program-owned vault");
+    }
+
+    // 3. Counter: wrong owner and oversized account MUST fail!
+    {
+        let mut svm = LiteSVM::new();
+        let payer = Keypair::new();
+        let program_id = Address::new_unique();
+        let wrong_owner = Address::new_unique();
+        let oversized = Address::new_unique();
+        svm.add_program(program_id, &counter_so).unwrap();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(wrong_owner, Account {
+            lamports: 1_000_000, data: vec![0u8; 8], owner: SYSTEM_PROGRAM_ID, ..Default::default()
+        }).unwrap();
+        svm.set_account(oversized, Account {
+            lamports: 1_000_000, data: vec![0u8; 16], owner: program_id, ..Default::default()
+        }).unwrap();
+        assert!(send_ix(&mut svm, &payer, &[], Instruction {
+            program_id, accounts: vec![AccountMeta::new(wrong_owner, false)], data: vec![1u8],
+        }).is_err(), "Counter must reject wrong owner");
+        assert!(send_ix(&mut svm, &payer, &[], Instruction {
+            program_id, accounts: vec![AccountMeta::new(oversized, false)], data: vec![1u8],
+        }).is_err(), "Counter must reject oversized dataLen != 8");
+    }
+
+    println!("[PASS] Security     | Dirty-init zeroing, owner pinning, exact-size, self-transfer & noop.so CPI guards verified!");
+}
+
 fn bench_vs_rust() {
     println!("\n==================================================================================");
     println!("  HEAD-TO-HEAD BENCHMARK: LeanSVM (Lean 4) vs Hand-Rolled `#![no_std]` Rust (LLVM 22 -O3)");
@@ -886,6 +1076,7 @@ fn main() {
     test_lending();
     test_dutch_auction();
     test_bonding_curve();
+    test_security_regressions();
     bench_vs_rust();
     println!("  ALL 8 FORMALLY VERIFIED LEAN 4 PROGRAMS + HEAD-TO-HEAD RUST BENCHMARKS PASSED!");
     println!("==================================================================================");

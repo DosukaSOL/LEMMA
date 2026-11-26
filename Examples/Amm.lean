@@ -49,26 +49,35 @@ private abbrev offVaultB   : UInt64 := 40
 private abbrev offResA     : UInt64 := 72
 private abbrev offResB     : UInt64 := 80
 private abbrev offLpSupply : UInt64 := 88
-private abbrev poolDataSize : UInt64 := 96
+private abbrev poolDataSize : UInt64 := 120
 
 /-- Pure mathematical constant-product swap formula (used in both runtime and formal proofs). -/
 def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   let amtAfterFee := (amountIn * (10000 - feeBps)) / 10000
   (amtAfterFee * resOut) / (resIn + amtAfterFee)
 
-@[noinline] private def handleInitPool (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def checkPool (pool : AccountView) (progId : Ptr) : SolanaM Unit := do
+  SolanaM.require (← AccountView.isWritable pool) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr pool) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen pool) == poolDataSize) Err.invalidAccountData
+  SolanaM.require ((← AccountView.readDataU8 pool offInit) == 1) Err.uninitializedAccount
+
+@[noinline] private def handleInitPool (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   let pool := a0
   let vaultA ← AccountView.nextCursor pool
   let vaultB ← AccountView.nextCursor vaultA
   SolanaM.require (← AccountView.isWritable pool) Err.invalidAccountData
-  SolanaM.require ((← AccountView.dataLen pool) >= poolDataSize) Err.accountDataTooSmall
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr pool) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen pool) == poolDataSize) Err.invalidAccountData
   SolanaM.require ((← AccountView.readDataU8 pool offInit) == 0) Err.accountAlreadyInitialized
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr vaultA) (AccountView.keyPtr vaultB))) Err.invalidArgument
   SolanaM.require (ixLen >= 6) Err.invalidInstructionData
   let bump   ← loadU8  ixPtr 1
   let decA   ← loadU8  ixPtr 2
   let decB   ← loadU8  ixPtr 3
   let feeBps ← loadU16 ixPtr 4
   SolanaM.require (feeBps <= 1000) Err.invalidArgument
+  zeroWords (AccountView.dataPtr pool) 0 (poolDataSize >>> 3)
   AccountView.writeDataU8  pool offInit 1
   AccountView.writeDataU8  pool offBump bump
   AccountView.writeDataU8  pool offDecA decA
@@ -80,7 +89,7 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   AccountView.writeDataU64 pool offResB 0
   AccountView.writeDataU64 pool offLpSupply 0
 
-@[noinline] private def handleAddLiquidity (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def handleAddLiquidity (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 25) Err.invalidInstructionData
   let user     := a0
   let pool     ← AccountView.nextCursor user
@@ -94,10 +103,13 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   let tokProgB ← AccountView.nextCursor tokProgA
 
   SolanaM.require (← AccountView.isSigner user) Err.missingRequiredSignature
-  SolanaM.require (← AccountView.isWritable pool) Err.invalidAccountData
-  SolanaM.require ((← AccountView.readDataU8 pool offInit) == 1) Err.uninitializedAccount
+  checkPool pool progId
+  checkTokenOr2022Prog tokProgA
+  checkTokenOr2022Prog tokProgB
   SolanaM.require (← pubkeyEq (AccountView.dataPtr pool + offVaultA) (AccountView.keyPtr vaultA)) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.dataPtr pool + offVaultB) (AccountView.keyPtr vaultB)) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr userA) (AccountView.keyPtr vaultA))) Err.invalidArgument
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr userB) (AccountView.keyPtr vaultB))) Err.invalidArgument
 
   let amtA  ← loadU64 ixPtr 1
   let amtB  ← loadU64 ixPtr 9
@@ -132,7 +144,7 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   AccountView.writeDataU64 pool offResB newResB
   AccountView.writeDataU64 pool offLpSupply newLp
 
-@[noinline] private def handleSwap (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def handleSwap (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 18) Err.invalidInstructionData
   let user       := a0
   let pool       ← AccountView.nextCursor user
@@ -147,8 +159,11 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   let tokProgOut ← AccountView.nextCursor tokProgIn
 
   SolanaM.require (← AccountView.isSigner user) Err.missingRequiredSignature
-  SolanaM.require (← AccountView.isWritable pool) Err.invalidAccountData
-  SolanaM.require ((← AccountView.readDataU8 pool offInit) == 1) Err.uninitializedAccount
+  checkPool pool progId
+  checkTokenOr2022Prog tokProgIn
+  checkTokenOr2022Prog tokProgOut
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr userIn)  (AccountView.keyPtr vaultIn)))  Err.invalidArgument
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr userOut) (AccountView.keyPtr vaultOut))) Err.invalidArgument
 
   let dir    ← loadU8  ixPtr 1
   let amtIn  ← loadU64 ixPtr 2
@@ -191,7 +206,7 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
     AccountView.writeDataU64 pool offResA newResA
     AccountView.writeDataU64 pool offResB newResB
 
-@[noinline] private def handleRemoveLiquidity (a0 : AccountView) (ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
+@[noinline] private def handleRemoveLiquidity (a0 : AccountView) (progId ixPtr : Ptr) (ixLen : UInt64) : SolanaM Unit := do
   SolanaM.require (ixLen >= 25) Err.invalidInstructionData
   let user     := a0
   let pool     ← AccountView.nextCursor user
@@ -206,10 +221,13 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   let tokProgB ← AccountView.nextCursor tokProgA
 
   SolanaM.require (← AccountView.isSigner user) Err.missingRequiredSignature
-  SolanaM.require (← AccountView.isWritable pool) Err.invalidAccountData
-  SolanaM.require ((← AccountView.readDataU8 pool offInit) == 1) Err.uninitializedAccount
+  checkPool pool progId
+  checkTokenOr2022Prog tokProgA
+  checkTokenOr2022Prog tokProgB
   SolanaM.require (← pubkeyEq (AccountView.dataPtr pool + offVaultA) (AccountView.keyPtr vaultA)) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.dataPtr pool + offVaultB) (AccountView.keyPtr vaultB)) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr userA) (AccountView.keyPtr vaultA))) Err.invalidArgument
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr userB) (AccountView.keyPtr vaultB))) Err.invalidArgument
 
   let lpBurn ← loadU64 ixPtr 1
   let minA   ← loadU64 ixPtr 9
@@ -235,21 +253,21 @@ def calcSwapOut (resIn resOut amountIn feeBps : Nat) : Nat :=
   AccountView.writeDataU64 pool offLpSupply (lpSup - lpBurn)
 
 def entrypoint (input : Ptr) : SolanaM Unit := do
-  let (n, a0, ix, _progId) ← Input.parseIxOnly input
+  let (n, a0, ix, progId) ← Input.parseIxOnly input
   SolanaM.require (ix.len >= 1) Err.invalidInstructionData
   let op ← loadU8 ix.ptr 0
   if op == 0 then
     SolanaM.require (n >= 3) Err.notEnoughAccountKeys
-    handleInitPool a0 ix.ptr ix.len
+    handleInitPool a0 progId ix.ptr ix.len
   else if op == 1 then
     SolanaM.require (n >= 10) Err.notEnoughAccountKeys
-    handleAddLiquidity a0 ix.ptr ix.len
+    handleAddLiquidity a0 progId ix.ptr ix.len
   else if op == 2 then
     SolanaM.require (n >= 11) Err.notEnoughAccountKeys
-    handleSwap a0 ix.ptr ix.len
+    handleSwap a0 progId ix.ptr ix.len
   else if op == 3 then
     SolanaM.require (n >= 11) Err.notEnoughAccountKeys
-    handleRemoveLiquidity a0 ix.ptr ix.len
+    handleRemoveLiquidity a0 progId ix.ptr ix.len
   else
     SolanaM.fail Err.invalidInstructionData
 

@@ -15,22 +15,22 @@ All Rust baselines are zero-dependency `#![no_std]` raw-pointer programs (leaner
 | Program | LeanSVM `.so` | Rust `-O3` `.so` | Size Advantage | LeanSVM CUs | Rust `-O3` CUs | Heap |
 |---|---:|---:|---:|---:|---:|---:|
 | **Noop** | **352 B** | 1,136 B | **3.23× smaller** | **2 CU** | 2 CU | 0 B |
-| **Counter** (init / inc / add) | **1,040 B** | 1,696 B | **1.63× smaller** | **24 / 29 / 31 CU** | 27 / 32 / 37 CU | 0 B |
-| **Vault** (3 accs + 32B eq + `sol_log_`) | **1,976 B** | 2,304 B | **1.17× smaller** | **167 CU** | 177 CU | 0 B |
-| **DutchAuction** (Token-2022 NFT + Clock + CPI) | **6,832 B** | 12,984 B | **1.90× smaller** | **3,080 / 4,574 CU** | 3,096 / 4,735 CU | 0 B |
+| **Counter** (init / inc / add, owner+size hardened) | **1,256 B** | 1,696 B | **1.35× smaller** | **45 / 50 / 52 CU** | 27 / 32 / 37 CU | 0 B |
+| **Vault** (3 accs + owner+alias+32B eq + `sol_log_`) | **2,472 B** | 2,304 B | 0.93× *(hardened)* | **195 CU** | 177 CU | 0 B |
+| **DutchAuction** (Token-2022 NFT + Clock + CPI + pinned IDs) | **8,456 B** | 12,984 B | **1.54× smaller** | **3,296 / 4,670 CU** | 3,096 / 4,735 CU | 0 B |
 
 ### Full Formally Verified DeFi & NFT Protocol Suite (SPL Token + SPL Token-2022 on LiteSVM)
 
 | Program | Instructions | `.text` | Stack | Heap | `.so` Size | LiteSVM CUs | Formal Lean 4 Proofs |
 |---|---:|---:|---:|---:|---:|---|---|
 | [`Examples.Noop`](Examples/Noop.lean) | 2 | 16 B | 0 B | 0 B | **352 B** | 2 | `noop_always_succeeds` |
-| [`Examples.Counter`](Examples/Counter.lean) | 88 | 704 B | 0 B | 0 B | **1,040 B** | 24 / 29 / 31 | `counter_increment_adds_one`, `counter_increment_overflow_rejected` |
-| [`Examples.Vault`](Examples/Vault.lean) | 119 | 952 B | 0 B | 0 B | **1,976 B** | 167 | `vault_transfer_conserves_lamports`, `vault_rejects_insufficient_funds` |
-| [`Examples.HashCheck`](Examples/HashCheck.lean) | 74 | 592 B | 56 B | 0 B | **1,728 B** | 393 | `sol_sha256` + `sol_get_clock_sysvar` + `sol_log_` |
-| [`Examples.Amm`](Examples/Amm.lean) (SPL + Token-2022) | 1,127 | 9,016 B | 384 B | 0 B | **9,944 B** | init 127, addLiq 4,533, swap 4,545, remLiq 4,563 | `amm_swap_preserves_k`, `amm_swap_never_drains_reserve` |
-| [`Examples.Lending`](Examples/Lending.lean) (SPL + Token-2022) | 1,179 | 9,432 B | 384 B | 0 B | **10,488 B** | init 295, dep 1,639, bor 3,374, liq 4,828, rep 3,252 | `lending_repay_monotone`, `lending_healthy_cannot_be_liquidated` |
-| [`Examples.DutchAuction`](Examples/DutchAuction.lean) (Token-2022 NFT) | 728 | 5,824 B | 384 B | 0 B | **6,832 B** | create 3,080, buyNow 4,574 | `dutchPrice_bounded`, `dutchPrice_monotone` |
-| [`Examples.BondingCurve`](Examples/BondingCurve.lean) (Token-2022 Mint/Burn) | 813 | 6,504 B | 304 B | 0 B | **7,464 B** | init 99, buy 4,876, sell 3,617 | `curve_buy_preserves_k`, `curve_sell_bounded_by_reserve` |
+| [`Examples.Counter`](Examples/Counter.lean) | 115 | 920 B | 0 B | 0 B | **1,256 B** | 45 / 50 / 52 | `counter_increment_adds_one`, `counter_increment_overflow_rejected`, `counter_rejects_wrong_owner` |
+| [`Examples.Vault`](Examples/Vault.lean) | 181 | 1,448 B | 0 B | 0 B | **2,472 B** | 195 | `vault_transfer_conserves_lamports`, `vault_rejects_insufficient_funds` |
+| [`Examples.HashCheck`](Examples/HashCheck.lean) | 100 | 800 B | 56 B | 0 B | **1,936 B** | 413 | `sol_sha256` + `sol_get_clock_sysvar` + `sol_log_` |
+| [`Examples.Amm`](Examples/Amm.lean) (SPL + Token-2022) | 1,341 | 10,728 B | 384 B | 0 B | **11,656 B** | init 292, addLiq 4,674, swap 4,686, remLiq 4,704 | `amm_swap_preserves_k`, `amm_swap_never_drains_reserve` |
+| [`Examples.Lending`](Examples/Lending.lean) (SPL + Token-2022) | 1,408 | 11,264 B | 384 B | 0 B | **12,320 B** | init 463, dep 1,812, bor 3,494, liq 5,001, rep 3,372 | `lending_repay_monotone`, `lending_healthy_cannot_be_liquidated`, `lending_initObligation_zero_inits_dirty_mem` |
+| [`Examples.DutchAuction`](Examples/DutchAuction.lean) (Token-2022 NFT) | 931 | 7,448 B | 384 B | 0 B | **8,456 B** | create 3,296, buyNow 4,670 | `dutchPrice_bounded`, `dutchPrice_monotone` |
+| [`Examples.BondingCurve`](Examples/BondingCurve.lean) (Token-2022 Mint/Burn) | 985 | 7,880 B | 304 B | 0 B | **8,840 B** | init 227, buy 4,978, sell 3,699 | `curve_buy_preserves_k`, `curve_sell_bounded_by_reserve` |
 
 *(Note: For CPI programs, ~1,200–4,200 CUs of the transaction total come from the SPL Token / Token-2022 / System Program CPI executions themselves; LeanSVM program compute overhead is typically only ~100–400 CUs.)*
 
@@ -90,7 +90,7 @@ Lean 4 Monomorphic LCNF (`Lean.Compiler.LCNF.monoExt`)
 - [`LeanSVM/Runtime.lean`](LeanSVM/Runtime.lean) — Pure functional `SvmState` verification model + `@[noinline]` hardware/syscall intrinsics + `bv_decide` memory read/write & byte-frame (`mem_writeU64_outside`) theorems
 - [`LeanSVM/Input.lean`](LeanSVM/Input.lean) — Demand-driven zero-copy account cursor, inline/auto-outlined 32-byte `pubkeyEq`/`pubkeyCopy`, checked arithmetic
 - [`LeanSVM/Math.lean`](LeanSVM/Math.lean) — Overflow-safe 128-bit `mulDiv64` / `mulDiv64Ceil` (fast 64-bit path + shared 128-bit fallback) & Newton `isqrt64`, with kernel-checked exact 128-bit arithmetic + memory-frame specs (`mul128_split_exact`, `div128Loop_exact`, `mulDiv64_ok_spec`, `mulDiv64Ceil_ok_spec`)
-- [`LeanSVM/CPI.lean`](LeanSVM/CPI.lean) — Zero-heap stack-allocated `sol_invoke_signed_c` CPIs for **SPL Token**, **SPL Token-2022** (`TransferChecked`, `MintTo`, `Burn`, `InitializeAccount3`), PDA signing, and `SystemProgram` (`Transfer`, PDA-signed `Allocate`, PDA-signed `Assign`)
+- [`LeanSVM/CPI.lean`](LeanSVM/CPI.lean) — Zero-heap stack-allocated `sol_invoke_signed_c` CPIs for **SPL Token**, **SPL Token-2022** (`TransferChecked`, `MintTo`, `Burn`, `InitializeAccount3`), PDA signing, and `SystemProgram` (`Transfer`, PDA-signed `Allocate`, PDA-signed `Assign`), plus formally verified canonical program-ID pinning (`checkSystemProg`, `checkTokenProg`, `checkTokenOr2022Prog`) and dirty-memory zero-initialization (`zeroWords`, `zeroWords_exact`)
 - [`LeanSVM/SBPF/`](LeanSVM/SBPF/) — Native sBPF v0/v3 ISA encoder, Murmur3-32 hasher, disassembler, peephole & value-tracking optimizer, and ELF64 `.so` linker
 - [`LeanSVM/Compiler/`](LeanSVM/Compiler/) — `IR`, `Lower`, `Optimize`, `RegAlloc`, `CodeGen`, `Driver`, and **`Proofs`** (60 kernel-checked compiler soundness theorems)
 
