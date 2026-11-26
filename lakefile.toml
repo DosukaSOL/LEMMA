@@ -12,3 +12,18 @@ name = "Examples"
 name = "lean-svm"
 root = "Main"
 supportInterpreter = true
+
+# ── LEMMA additions (everything above this line is upstream lean-svm) ─────────────────────
+[[lean_lib]]
+name = "LemmaTest"
+srcDir = "tests"
+globs = ["LemmaTest.+"]
+
+[[lean_exe]]
+name = "lemma-test"
+srcDir = "tests"
+root = "LemmaTest.Main"
+supportInterpreter = true
+
+[[lean_lib]]
+name = "Lemma"
