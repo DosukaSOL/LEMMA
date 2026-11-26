@@ -8,3 +8,19 @@
 *.elf
 *.bin
 .DS_Store
+
+# ── LEMMA additions ─────────────────────────────────────────────────────────
+.lake/
+target/
+build/
+node_modules/
+# secrets & keys: never commit (test keypairs are generated at runtime)
+.env
+.env.*
+*.pem
+*.key
+id_*
+*keypair*.json
+*-keypair.json
+wallet*.json
+*.secret

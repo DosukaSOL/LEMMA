@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# LEMMA pre-commit hook: block commits that contain secrets or obvious proof holes.
+# Install with: scripts/install-hooks.sh
+set -euo pipefail
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --pre-commit --staged --redact --no-banner --config .gitleaks.toml
+else
+  echo "pre-commit: gitleaks not found on PATH; install it (see SECURITY.md) or commit with care." >&2
+  exit 1
+fi
+scripts/check-proof-holes.sh --staged

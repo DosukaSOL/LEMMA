@@ -1,0 +1,11 @@
+# gitleaks configuration: the default ruleset plus a rule for Solana keypair JSON files.
+title = "LEMMA gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "solana-keypair-json"
+description = "Solana CLI keypair file (JSON array of 64 secret-key bytes)"
+regex = '''\[\s*(?:\d{1,3}\s*,\s*){63}\d{1,3}\s*\]'''
+keywords = [","]

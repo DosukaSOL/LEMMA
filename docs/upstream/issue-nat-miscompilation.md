@@ -3,7 +3,7 @@
   decides whether to file it.
 -->
 
-# `Nat` arithmetic is lowered to wrapping 64-bit ops, so compiled code can disagree with proofs
+# Two silent miscompilations: wrapping `Nat` arithmetic, and dropped constructor payloads
 
 **Commit:** `d49665eac029d0a53a8f8fc324d840df6e9649d5`
 
@@ -49,6 +49,24 @@ Lower `Nat` ops as exact-or-abort: overflow-checked `add`/`mul` that call the `a
 saturating `sub`, `div`/`mod` that special-case zero, and a compile error for literals `≥ 2^64`. A
 tested implementation with kernel-checked lemmas for each scheme is available in the LEMMA fork
 (`patches/0001-sound-nat-lowering.md`).
+
+## Second bug: constructor payloads are silently dropped (`valToReg`)
+
+For a constructor with a tag other than 0 and a runtime field, `valToReg` returns only the tag. So an
+`Option.some q` (or any sum value) that flows through an `if` join point or a multi-branch return
+loses `q`, and `q` later reads as `0`:
+
+```lean
+let r := if mode == 0 then mulDivFloor a b d else mulDivCeil a b d   -- Option UInt64
+match r with
+| none => SolanaM.fail 7
+| some q => SolanaM.require (q == c) Err.invalidArgument
+```
+
+The generated code compares `c` against the constant `0`. In differential testing this pattern gave
+6,978 wrong results for functions whose Lean definitions are proven correct. `dynCtor` values have
+the same problem. A safe fix is to make this a compile error (LEMMA patch 0002); proper multi-register
+join parameters would be the full feature.
 
 ## Also noted
 

@@ -1,0 +1,120 @@
+# LEMMA continuous integration.
+#
+# Supply chain: every third-party action is pinned to a full commit SHA, and every downloaded
+# toolchain is verified against a pinned SHA-256. No secrets are used, and no step deploys
+# anything to any cluster.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLATFORM_TOOLS_VERSION: v1.58
+  PLATFORM_TOOLS_SHA256: 7b82eb420b5aebd1e5590db0ae25c523eca06724d4238ae02139690535636c37
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  CARGO_AUDIT_VERSION: 0.23.0
+
+jobs:
+  lean:
+    name: Lean — build, proofs, audit, tests, compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache Lean toolchain and build tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.lemma-toolchain
+            .lake
+          key: lean-${{ hashFiles('lean-toolchain') }}-${{ hashFiles('lakefile.toml', 'lake-manifest.json') }}-${{ github.sha }}
+          restore-keys: |
+            lean-${{ hashFiles('lean-toolchain') }}-${{ hashFiles('lakefile.toml', 'lake-manifest.json') }}-
+      - name: Install Lean (pinned, checksum-verified)
+        run: echo "$(scripts/install-lean.sh)" >> "$GITHUB_PATH"
+      - name: Textual proof-hole guard
+        run: scripts/check-proof-holes.sh
+      - name: Build everything and kernel-check every proof
+        run: lake build LeanSVM Examples lean-svm Lemma LemmaTest lemma-test lemma-audit lemma-vectors
+      - name: Axiom audit + runtime-Nat lint (fails if the committed report is stale)
+        run: lake exe lemma-audit
+      - name: Test vectors are up to date with the specification
+        run: lake exe lemma-vectors
+      - name: Interpreter test suites (differential, vectors, attacks)
+        run: lake exe lemma-test
+      - name: Compile all programs to sBPF .so
+        run: scripts/build-programs.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: programs
+          path: build/*.so
+          if-no-files-found: error
+
+  litesvm:
+    name: LiteSVM — execute programs on the real SVM
+    needs: lean
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: programs
+          path: build
+      - name: Install Solana platform-tools (for upstream's Rust baselines)
+        run: |
+          dest="$HOME/.cache/solana/${PLATFORM_TOOLS_VERSION}/platform-tools"
+          mkdir -p "$dest"
+          curl -sSLf -o /tmp/pt.tar.bz2 \
+            "https://github.com/anza-xyz/platform-tools/releases/download/${PLATFORM_TOOLS_VERSION}/platform-tools-linux-x86_64.tar.bz2"
+          echo "${PLATFORM_TOOLS_SHA256}  /tmp/pt.tar.bz2" | sha256sum -c -
+          tar -xjf /tmp/pt.tar.bz2 -C "$dest"
+      - name: Build Rust baselines
+        run: |
+          SOLANA_TOOLS="$HOME/.cache/solana/${PLATFORM_TOOLS_VERSION}/platform-tools"
+          mkdir -p build/rust
+          for name in noop counter vault dutch_auction; do
+            dir="benchmarks/rust-${name//_/-}"
+            "$SOLANA_TOOLS/rust/bin/rustc" \
+              --crate-type cdylib --target sbpf-solana-solana \
+              -C opt-level=3 -C lto=fat -C panic=abort -C strip=symbols \
+              -C linker="$SOLANA_TOOLS/llvm/bin/ld.lld" \
+              -C link-arg=--Bdynamic -C link-arg=-shared -C link-arg=--entry=entrypoint \
+              -C link-arg=--no-rosegment -C link-arg=-z -C link-arg=notext \
+              "$dir/src/lib.rs" -o "build/rust/rust_${name}.so"
+          done
+      - name: Run upstream LiteSVM suite against LEMMA-built binaries
+        run: cargo run --locked --release --manifest-path svm-runner/Cargo.toml --bin svm-runner
+      - name: LEMMA on LiteSVM (attack scenarios, patch 0001 abort, all JSON vectors)
+        run: cargo run --locked --release --manifest-path svm-runner/Cargo.toml --bin lemma
+
+  security:
+    name: Secret scan + dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: gitleaks (full history, pinned binary)
+        run: |
+          curl -sSLf -o /tmp/gl.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gl.tgz" | sha256sum -c -
+          tar -xzf /tmp/gl.tgz -C /tmp gitleaks
+          /tmp/gitleaks git --redact --no-banner --config .gitleaks.toml .
+      - name: cargo audit (RustSec advisories for committed Cargo.lock files)
+        run: |
+          cargo install cargo-audit --locked --version "${CARGO_AUDIT_VERSION}"
+          cargo audit --file svm-runner/Cargo.lock

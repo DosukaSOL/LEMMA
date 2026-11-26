@@ -1,0 +1,19 @@
+LEMMA
+Copyright 2026 The LEMMA contributors
+
+LEMMA is a fork of lean-svm (https://github.com/aeyakovenko/lean-svm).
+
+Licensing scope
+---------------
+The Apache License, Version 2.0 (see LICENSE) applies to LEMMA's own contributions:
+
+  Lemma/, Lemma.lean, tests/, patches/, docs/ (except docs/upstream/lean-svm-README.md),
+  scripts/install-lean.sh, scripts/build-programs.sh, scripts/check-proof-holes.sh,
+  scripts/install-hooks.sh, assets/, vectors/, .github/, .githooks/, .gitleaks.toml,
+  programs.txt, README.md, SECURITY.md, NOTICE, and the LEMMA patches to
+  LeanSVM/Compiler/Lower.lean described in patches/.
+
+All other files come from upstream lean-svm, which at the forked commit
+(d49665eac029d0a53a8f8fc324d840df6e9649d5) did not include a license. Those files are
+NOT covered by LEMMA's license. Their terms are whatever their author grants. Anyone
+redistributing this repository should confirm the upstream license with its author.
