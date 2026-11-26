@@ -1,0 +1,244 @@
+---
+name: svm-security-testing
+description: >-
+  Security audit, formal proof, and LiteSVM adversarial testing guide for Solana
+  programs built with lean-svm. Use whenever designing, reviewing, hardening, or
+  testing a lean-svm program to catch common SVM bugs (same-tx account revival,
+  dirty-buffer init, missing owner/size/discriminator checks, spoofed CPI programs,
+  SPL/lamport self-transfer aliasing, share-pool inflation, and proof-to-runtime gaps).
+---
+
+# SVM Security Testing & Hardening Guide (`lean-svm`)
+
+Pure mathematical (`Nat`) proofs verify economic formulas, **not** Solana's binary account ABI, CPI dispatch, or transaction lifecycle. A bug at the SVM boundary (dirty account memory, unpinned CPI program ID, same-tx rent refund) can bypass every pure-math invariant without violating a single `Nat` theorem.
+
+Use this checklist whenever writing, reviewing, or testing any `lean-svm` program.
+
+---
+
+## Core Principle: SVM Abort Semantics
+
+- **Error paths need zero cleanup:** When a Solana instruction returns a nonzero error code (`SolanaM.fail` / failed `SolanaM.require`), the SVM discards **all** account and lamport mutations across the entire transaction. Never spend CUs zeroing or rolling back state before returning an error.
+- **Success paths persist within the transaction:** Any account mutated by a *succeeding* instruction — including an account drained to `0` lamports — remains alive with its exact bytes for subsequent instructions in the **same transaction**. Garbage collection only happens at the end of the transaction if lamports are still `0`.
+
+---
+
+## Vulnerability Classes, `lean-svm` Fixes, Proofs & LiteSVM Tests
+
+### 1. Same-Tx Account Revival & Cross-Type Confusion
+
+**The Bug:**
+A `CloseAccount` instruction sets only the 4-byte discriminator/magic to `0` and drains lamports to `dest`. In the **same transaction**, an attacker appends:
+1. `CloseAccount(acc)` → sets `data[0..4] = 0`, `lamports = 0`, leaves bytes `4..N` intact.
+2. `SystemProgram::Transfer(attacker → acc, rent)` → prevents end-of-tx garbage collection!
+3. `InitOtherType(acc)` → sees `magic == 0` and `dataLen >= otherSize`, skips zeroing fields it assumes are `0`, and inherits residual bytes from the previous type (e.g., an owner pubkey overlapping a `shares` or `capital` `u64`!).
+
+**How to Prevent (`lean-svm`):**
+1. Write a **permanent nonzero tombstone magic** on close (e.g., `MAGIC_CLOSED : UInt32 := 0x44454144`), distinct from `0` and every live magic, so neither live handlers nor fresh-init (`magic == 0`) branches can ever accept a closed account.
+2. Enforce **exact** `dataLen == exactSize` (never `>=`) on every account check and init path, and give distinct account types distinct sizes where practical.
+3. Call `LeanSVM.CPI.zeroWords (AccountView.dataPtr acc) 0 (size >>> 3)` on **both** fresh initialization and close (defense-in-depth; costs ~5 CUs per 8-byte word on one-time init/close, **0 CU on hot paths**).
+
+**Formal Proof Pattern (`SvmState.mem`):**
+- Use `LeanSVM.CPI.zeroWords_exact` + `LeanSVM.CPI.bind_ok_elim` to prove:
+  1. Closing writes `MAGIC_CLOSED ≠ 0`, distinct from all live magics, and zeroes `[4, size)`.
+  2. Fresh initialization from **arbitrary dirty `SvmState.mem`** always yields `0` for all balance/share/debt fields (see `Examples.Lending.lending_initObligation_zero_inits_dirty_mem`).
+
+**LiteSVM Test Recipe:**
+```rust
+// Single atomic transaction: [CloseAccount(acc), SystemTransfer(payer -> acc, rent), InitOtherType(acc)]
+// Assert the tx FAILS!
+// Also test [CloseAccount(acc), SystemTransfer(payer -> acc, rent)] alone, then inspect:
+//   assert_eq!(&acc.data[0..4], &MAGIC_CLOSED.to_le_bytes());
+//   assert!(acc.data[4..].iter().all(|&b| b == 0));
+//   and verify a follow-up Init*(acc) in the next tx ALSO fails!
+```
+
+---
+
+### 2. Dirty-Buffer Initialization
+
+**The Bug:**
+An initialization path checks `magic == 0` (or `initialized == 0` / `idx == 0`), writes header fields, and then updates a balance via `old + amount` without first zeroing the account body. If the account was pre-filled or previously used, `old` is nonzero garbage.
+
+**How to Prevent:**
+- Always call `zeroWords (AccountView.dataPtr acc) 0 (size >>> 3)` before writing initial fields, or explicitly store `0` to every single field (including padding and array slots).
+- Never use a mutable business field (like `idx == 0` or `balance == 0`) as the initialization flag — use a dedicated immutable magic/discriminator byte or `u32`.
+
+**LiteSVM Test Recipe:**
+- Construct the fresh account in `svm.set_account(...)` with `magic == 0` (`data[0..4] = 0`) and **every other byte filled with `0xFF` or sentinel nonzero `u64` values** (e.g. `999_999_999` in balance/shares/collateral slots).
+- Execute `Init` / first `Deposit` and assert every balance/counter equals the exact deposited amount (or `0`), with zero leaked sentinel bytes.
+
+---
+
+### 3. Missing Owner Pinning, Exact Size, or Discriminator Checks
+
+**The Bug:**
+Forgetting `pubkeyEq (AccountView.ownerPtr acc) progId`, checking `dataLen >= size` instead of `== size`, or omitting a type magic lets an attacker:
+- Pass a **System-owned** (or attacker-program-owned) account populated with arbitrary forged balances/authority pubkeys.
+- Pass an account of Type A into a handler expecting Type B.
+
+**How to Prevent:**
+Centralize a single `@[noinline]` validator per account type:
+```lean
+@[noinline] def checkMyAccount (acc : AccountView) (progId : Ptr) : SolanaM Unit := do
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr acc) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen acc) == MY_SIZE) Err.invalidAccountData
+  SolanaM.require ((← loadU32 (AccountView.dataPtr acc) 0) == MAGIC_MY) Err.invalidAccountData
+```
+
+**Formal Proof Pattern:**
+- Prove `rejects_wrong_owner`: if `acc.owner ≠ progId`, the handler returns `Err.illegalOwner` with `s' = s` (see `Examples.Counter.counter_rejects_wrong_owner`).
+
+**LiteSVM Test Recipe:**
+- Pass an account with identical valid data bytes but `owner: SYSTEM_PROGRAM_ID` → assert error.
+- Pass a program-owned account with `data.len() == MY_SIZE + 8` (oversized) and `MY_SIZE - 8` (undersized) → assert error.
+- Pass a valid initialized account of Type A where Type B is expected → assert error.
+
+---
+
+### 4. Arbitrary CPI / Spoofed Program ID (`noop.so` Attack)
+
+**The Bug:**
+A program invokes `tokenTransferChecked tokProg ...` or `systemTransfer sysProg ...` without verifying `tokProg` or `sysProg`'s 32-byte pubkey. An attacker deploys/passes a trivial executable `noop.so` (returns `0` immediately) as `tokProg` or `sysProg`: the CPI succeeds, no tokens/SOL move, and the program credits the attacker's internal balance for free.
+
+**How to Prevent:**
+Always pin every CPI target using `LeanSVM.CPI`:
+- `checkSystemProg sysProg` (`11111111111111111111111111111111`)
+- `checkTokenProg tokProg` (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`)
+- `checkTokenOr2022Prog tokProg` (SPL Token OR `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`)
+- For custom downstream CPI targets, pin against the 32-byte pubkey stored in an immutable config account.
+
+**Formal Proof Pattern:**
+- Already proven in `LeanSVM.CPI`: `checkSystemProg_sound`, `checkTokenProg_sound`, `checkTokenOr2022Prog_sound`.
+
+**LiteSVM Test Recipe:**
+- Deploy `build/noop.so` at a fresh `Address::new_unique()` in LiteSVM.
+- Call **every** instruction that performs a token or system CPI with `fake_prog` in place of `SPL_TOKEN_ID` / `SPL_TOKEN_2022_ID` / `SYSTEM_PROGRAM_ID`.
+- Assert **every single one** returns `Err`.
+
+---
+
+### 5. Account Aliasing & SPL / Lamport Self-Transfers
+
+**The Bug:**
+Two account arguments point to the same pubkey:
+- **SPL Token self-transfer (`source == dest`):** Passing `vault` as `destTok` on withdrawal makes SPL Token execute a **no-op** (vault SPL balance unchanged) while the program still decrements its internal `vaultBalance` (`internal < SPL`, permanently orphaning tokens and breaking exact stock conservation).
+- **Direct lamport self-transfer (`from == to`):** Reading both `fromBal` and `toBal` before writing (`setLamports from (bal - amt); setLamports to (bal + amt)`) overwrites the debit with `bal + amt` (or corrupts internal balances).
+- **Two-party state aliasing (`pflA == pflB`, `vaultA == vaultB`):** Reading both balances, mutating both, and writing back loses the first write or lets a user trade/liquidate against themselves.
+
+**How to Prevent:**
+Explicitly require `!(← pubkeyEq (AccountView.keyPtr a) (AccountView.keyPtr b))` for every pair of accounts that must be distinct:
+- `userTok != vault`, `destTok != vault`, `liqTok != vault`
+- `fromAcc != toAcc` on direct lamport transfers
+- `partyA != partyB`, `vaultA != vaultB`, `acc != dest` on `CloseAccount`
+
+**LiteSVM Test Recipe:**
+- Pass `vault` as `destTok` on every withdrawal / fee payout → assert error.
+- Pass `acc` as `dest` on `CloseAccount` and `from` as `to` on lamport transfers → assert error.
+- Pass `partyA` for both sides of a bilateral trade / liquidation takeover → assert error.
+
+---
+
+### 6. CPI Proxy / Wrapper Forwarding Unvalidated Opcodes or Unpinned Targets
+
+**The Bug:**
+A wrapper/router/AMM program holds a PDA authority over an LP account and CPIs into a core program. If the wrapper:
+- Forwards a user-supplied `mode` / `op` byte without allowlisting the exact modes its quoting/accounting logic expects (e.g., forwarding `mode = 2` hand-off when the wrapper's spread calculation only handles `mode = 0` open / `mode = 1` close), or
+- Fails to pin the target `market` / `pool` / `mint` account in its config,
+
+then a caller can force the wrapper's PDA to sign unintended operations or trade on an adversarial permissionless market.
+
+**How to Prevent:**
+- Allowlist every forwarded enum/mode explicitly (`SolanaM.require (mode == 0 || mode == 1) ...`).
+- Pin every target account (`percProg`, `lpPortfolio`, `market`, `mint`) in the wrapper's immutable config.
+
+**LiteSVM Test Recipe:**
+- Call every wrapper instruction with every out-of-range / unexpected `mode` byte (`2, 3, 255`) and with a rogue permissionless market → assert error.
+
+---
+
+### 7. Share-Pool / Vault Accounting Footguns (ERC-4626 Class)
+
+**The Bug:**
+Pro-rata share pools (`minted = amount * totalShares / totalAssets`, `payout = burnShares * totalAssets / totalShares`) have four classic edge cases:
+1. **Unclaimed assets before first LP (`totalShares == 0 && assets > 0`):** If fees or donations accrue before any LP deposits, depositing `1` unit mints 100% of shares and steals all prior fees/donations.
+2. **Drained-pool share revival (`assets == 0 && totalShares > 0`):** If bad debt drains `assets` to `0` while old LPs keep `totalShares > 0`, a new LP minting 1:1 immediately donates `oldShares / (oldShares + new)` of their deposit to the wiped-out LPs.
+3. **Donation inflation (`totalShares == 1` + large direct donation):** Inflates 1 share to huge value so honest deposits truncate (`minted == 0`) or lose value to rounding.
+4. **Receipt-to-total desync (`receipt.shares > totalShares`):** Always guard `curSh <= totSh` on redemption and prove `totalShares = ∑ receipt.shares`.
+5. **Trapped rent on closure:** Allowing permissionless pool tombstoning while receipts still hold nonzero worthless shares (`shares > 0`) permanently blocks LPs from closing their receipt accounts if `Withdraw` rejects tombstoned pools.
+
+**LiteSVM Test Recipe:**
+- Test all 4 boundary states explicitly:
+  - `(totSh = 0, assets = 1_000_000)` → attempt `1`-unit deposit + withdraw.
+  - `(totSh = 100_000, assets = 0)` → new LP deposits `10_000`, verify old LP cannot withdraw new LP's funds.
+  - `(totSh = 1, assets = 1)` → donate `100_000_000` → second LP deposits `50_000_000` & `150_000_000`, assert attacker cannot profit.
+  - Drain pool to `0` while LP holds shares → verify LP can still burn worthless shares and reclaim receipt rent.
+
+---
+
+### 8. Missing Signer, Writable, PDA Derivation & Pre-Funding Griefing
+
+**The Bug:**
+- Checking `owner == authority` without checking `AccountView.isSigner authority`.
+- Creating a PDA via `SystemProgram::CreateAccount` — an attacker can send 1 lamport to the deterministic PDA address beforehand, permanently bricking `CreateAccount`.
+
+**How to Prevent:**
+- Always check `AccountView.isSigner` on every authority and `AccountView.isWritable` on every mutated account.
+- Create PDAs on-chain using **`SystemProgram::Transfer` (top-up rent diff) + `systemAllocateSigned` + `systemAssignSigned`** (already in `LeanSVM.CPI`), which succeeds even if the PDA already holds lamports.
+
+**LiteSVM Test Recipe:**
+- Pre-fund the target PDA with `1` lamport before running `Init*` → assert `Init*` still succeeds!
+- Omit `.is_signer = true` on every authority account in every instruction → assert error.
+
+---
+
+### 9. Stale Cross-Account State & Multi-Instruction Ordering
+
+**The Bug:**
+In multi-account / cross-margin protocols, allowing withdrawals, risk-increasing trades, spread transfers, or liquidations while *other* legs/positions on the same user are stale lets attackers either extract collateral before realizing losses or selectively liquidate a hedged user without crediting their winning legs.
+
+**How to Prevent:**
+- Stamp `lastRefreshSlot = curSlot` on every state refresh and enforce `lastRefreshSlot == curSlot` across all active positions before withdrawal, liquidation, or any collateral-reducing transfer (including spread payments).
+
+**LiteSVM Test Recipe:**
+- Advance `Clock.slot`, refresh only one leg, attempt `Withdraw`, `Liquidate`, and spread-paying `Trade` → assert all fail until every active leg is refreshed in the same slot.
+
+---
+
+### 10. Arithmetic Overflow, Underflow & Rounding Direction
+
+**The Bug:**
+- Unchecked `UInt64` `+` / `-` wrapping silently in sBPF.
+- 64-bit `a * b / c` overflowing `2^64` on intermediate products.
+- Rounding in favor of the user (floor on debt/margin/cost, ceil on payout/mint) allowing dust extraction loops.
+
+**How to Prevent:**
+- Use `checkedAdd64` / `checkedSub64` for every balance/supply/debt mutation.
+- Use `LeanSVM.Math.mulDiv64` (floor, exact 128-bit) for user payouts/mints/swaps and `LeanSVM.Math.mulDiv64Ceil` (ceil, exact 128-bit) for margin requirements, fees, and debt/loss debits.
+- Prove rounding direction in Lean 4 using `mulDiv64_ok_spec` / `mulDiv64Ceil_ok_spec`.
+
+**LiteSVM Test Recipe:**
+- Test `u64::MAX` overflow inputs on `Add`/`Deposit`/`Borrow` → assert error.
+- Test 128-bit-requiring values (`a * b > 2^64`, e.g. `10^12 * 10^9 / 10^10`) → assert exact 128-bit result without wraparound.
+- Run a randomized stateful fuzzer (500–1,000+ steps) asserting exact global stock conservation (`sum_internal == spl_vault_balance`) after **every** transaction.
+
+---
+
+## Pre-Deployment Verification Checklist
+
+Before deploying any `lean-svm` program to devnet or mainnet:
+
+1. **Zero `sorry`, zero custom axioms:** Run `#print axioms` on every theorem — only standard Lean axioms (`propext`, `Quot.sound`, `Classical.choice`, `Lean.ofReduceBool` / `bv_decide`).
+2. **Audit every handler's account header checks:**
+   - `isSigner` on all authorities
+   - `isWritable` on all mutated accounts
+   - `owner == progId` on all program state accounts
+   - Exact `dataLen == exactSize`
+   - Type magic check (`!= 0`, `!= MAGIC_CLOSED`)
+   - Distinct-key checks (`!=`) for all aliasable pairs (`dest != vault`, `from != to`, `partyA != partyB`)
+   - Canonical CPI program ID pinning (`checkTokenProg` / `checkTokenOr2022Prog` / `checkSystemProg`)
+3. **Audit every init & close path:**
+   - Full `zeroWords` on fresh init AND close
+   - Permanent nonzero `MAGIC_CLOSED` tombstone on close
+   - Verified with a `SvmState.mem` theorem (not just a `Nat` model!)
+4. **Run adversarial LiteSVM tests** covering every applicable item (#1–#10 above), plus a multi-step stateful invariant fuzzer against real SPL Token / Token-2022 accounts (zero vault mocks).

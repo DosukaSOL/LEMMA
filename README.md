@@ -93,6 +93,7 @@ Lean 4 Monomorphic LCNF (`Lean.Compiler.LCNF.monoExt`)
 - [`LeanSVM/CPI.lean`](LeanSVM/CPI.lean) — Zero-heap stack-allocated `sol_invoke_signed_c` CPIs for **SPL Token**, **SPL Token-2022** (`TransferChecked`, `MintTo`, `Burn`, `InitializeAccount3`), PDA signing, and `SystemProgram` (`Transfer`, PDA-signed `Allocate`, PDA-signed `Assign`), plus formally verified canonical program-ID pinning (`checkSystemProg`, `checkTokenProg`, `checkTokenOr2022Prog`) and dirty-memory zero-initialization (`zeroWords`, `zeroWords_exact`)
 - [`LeanSVM/SBPF/`](LeanSVM/SBPF/) — Native sBPF v0/v3 ISA encoder, Murmur3-32 hasher, disassembler, peephole & value-tracking optimizer, and ELF64 `.so` linker
 - [`LeanSVM/Compiler/`](LeanSVM/Compiler/) — `IR`, `Lower`, `Optimize`, `RegAlloc`, `CodeGen`, `Driver`, and **`Proofs`** (60 kernel-checked compiler soundness theorems)
+- [`.agents/skills/svm-security-testing/SKILL.md`](.agents/skills/svm-security-testing/SKILL.md) — Reusable agent & developer security skill covering common SVM vulnerabilities (same-tx account revival, dirty-buffer init, owner/size/discriminator checks, spoofed `noop.so` CPIs, SPL/lamport self-transfer aliasing, share-pool inflation, and LiteSVM + `SvmState.mem` proof patterns)
 
 ---
 
