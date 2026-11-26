@@ -74,3 +74,9 @@ join parameters would be the full feature.
 `bv_decide`'s native-evaluation axioms (`*._native.bv_decide.ax_*`). That means they trust the
 compiled LRAT checker, not only the kernel. This may be acceptable, but the README's "zero custom
 axioms" doesn't make it visible.
+
+**Licence file (separate, minor):** the `LICENSE` added in `2e36957` isn't the verbatim
+Apache-2.0 text. Several clauses are worded differently from the official version at
+<https://www.apache.org/licenses/LICENSE-2.0>, e.g. §5 ("without any warranty of any kind"
+instead of "without any additional terms or conditions"), §4(c), §8 and §9. You may want to
+replace it with the official text so the terms are unambiguous.

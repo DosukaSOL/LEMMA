@@ -1,5 +1,9 @@
 # `lean-svm` — Native Lean 4 → Solana sBPF Optimizing Compiler Toolchain
 
+> **⚠️ Educational & Research Purposes Only — Not Audited for Production Use**
+>
+> This software, compiler toolchain, formal proofs, and example programs are provided **strictly for educational and research purposes**. They have **not** undergone an independent third-party security audit and are **not** intended for production deployment or custody of real user funds. Formal proofs cover only the explicitly stated models and properties and do not guarantee the absence of bugs in unmodeled runtime boundaries, compiler passes, or downstream integrations. Use at your own risk — provided **"AS IS"** without warranty of any kind under the [Apache License 2.0](LICENSE).
+
 `lean-svm` is a **native, zero-dependency Lean 4 to Solana SVM (sBPF) compiler toolchain** that compiles formally verified Lean 4 programs **directly from Lean's monomorphic LCNF IR into minimal Solana sBPF ELF64 (`.so`) bytecode** — with **zero heap allocations**, **no C runtime**, **no LLVM**, and **no external Lean dependencies**.
 
 Write Solana on-chain programs in Lean 4, prove critical invariants (lamport conservation, constant-product $k' \ge k$, LTV solvency, monotonic Dutch price decay, overflow rejection) directly in Lean 4's kernel with zero `sorry` and zero custom axioms, and compile the exact same definitions directly to sBPF binaries that **beat hand-rolled `#![no_std]` Rust (`rustc` + LLVM 22 `-O3`)** on both `.so` object size and Compute Units (CUs).
@@ -131,3 +135,11 @@ lake exe lean-svm build Examples.Amm Examples.Amm.entrypoint -o build/amm.so
 # 3. Run full build + compile + LiteSVM verification & head-to-head Rust benchmarks
 ./scripts/build-and-test.sh
 ```
+
+---
+
+## License & Disclaimer
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+This repository is experimental and provided **for educational and research purposes only**. Do not deploy compiled binaries or example programs to mainnet with real funds without thorough independent auditing and end-to-end verification.

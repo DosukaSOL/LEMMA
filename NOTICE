@@ -1,19 +1,30 @@
 LEMMA
 Copyright 2026 The LEMMA contributors
 
-LEMMA is a fork of lean-svm (https://github.com/aeyakovenko/lean-svm).
+This product includes software from lean-svm (https://github.com/aeyakovenko/lean-svm),
+Copyright 2026 lean-svm contributors.
 
-Licensing scope
----------------
-The Apache License, Version 2.0 (see LICENSE) applies to LEMMA's own contributions:
+Licensing
+---------
+LEMMA's own contributions are licensed under the Apache License, Version 2.0. The file
+LICENSE is the verbatim official text (https://www.apache.org/licenses/LICENSE-2.0).
 
-  Lemma/, Lemma.lean, tests/, patches/, docs/ (except docs/upstream/lean-svm-README.md),
-  scripts/install-lean.sh, scripts/build-programs.sh, scripts/check-proof-holes.sh,
-  scripts/install-hooks.sh, assets/, vectors/, .github/, .githooks/, .gitleaks.toml,
-  programs.txt, README.md, SECURITY.md, NOTICE, and the LEMMA patches to
-  LeanSVM/Compiler/Lower.lean described in patches/.
+Upstream lean-svm declares in its README (since commit
+2e3695729651b56d17db0d5aba93b1e66da3adf9) that it is licensed under the Apache License,
+Version 2.0. Its own license file is preserved unmodified in LICENSE-lean-svm. Note that
+the wording of that file differs from the official Apache-2.0 text in several clauses
+(including sections 4(c), 5, 8 and 9). Questions about the terms of the upstream code
+should be directed to its author. This notice is informational and is not legal advice.
 
-All other files come from upstream lean-svm, which at the forked commit
-(d49665eac029d0a53a8f8fc324d840df6e9649d5) did not include a license. Those files are
-NOT covered by LEMMA's license. Their terms are whatever their author grants. Anyone
-redistributing this repository should confirm the upstream license with its author.
+Before upstream added a license (at d49665eac029d0a53a8f8fc324d840df6e9649d5, the commit
+LEMMA was forked from), the upstream files carried no license grant.
+
+Modifications
+-------------
+LEMMA changes these upstream files; all other upstream files are unchanged:
+  LeanSVM/Compiler/Lower.lean  compiler soundness patches, documented in patches/
+  lakefile.toml                added lean_lib / lean_exe entries
+  svm-runner/Cargo.toml        added default-run (svm-runner/src/bin/lemma.rs is new)
+  .gitignore                   added build, secret and keypair patterns
+  README.md                    replaced by the LEMMA README; the upstream README is kept
+                               verbatim in docs/upstream/lean-svm-README.md

@@ -156,8 +156,9 @@ welcome.
 
 ## License
 
-LEMMA's own contributions are licensed under [Apache-2.0](LICENSE). Upstream lean-svm files had no
-license at the forked commit and are **not** covered; see [NOTICE](NOTICE).
+LEMMA is licensed under [Apache-2.0](LICENSE). Upstream lean-svm is Apache-2.0 too, and its own
+licence file is preserved in [`LICENSE-lean-svm`](LICENSE-lean-svm). See [NOTICE](NOTICE) for
+attribution and the list of modified upstream files.
 
 ## Acknowledgements
 
