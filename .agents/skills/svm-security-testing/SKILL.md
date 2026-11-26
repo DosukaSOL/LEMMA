@@ -315,6 +315,24 @@ In multi-account / cross-margin protocols, allowing withdrawals, risk-increasing
 
 ---
 
+### 16. Adversarial External PropAMM / Matcher CPI-Out Containment (0 Signer Delegation)
+
+**The Bug:**
+- **CPI-In signer delegation:** Having a taker call an untrusted third-party matcher which CPIs into core with `takerOwner (S)` delegates the taker's top-level signer authority to closed-source code (enabling SOL/SPL drains or spoofed trades).
+- **`noop.so` / stale-buffer quote replay:** Reading a quote struct written by an external matcher without a monotonic nonce lets a no-op program replay a stale quote forever.
+- **Unbounded fill / abusive pricing / self-CPI / re-entrancy:** Passing core state accounts or skipping core-side `fillQty ≤ maxQty`, `limitPrice`, `maxMoveBps`, or `matcherProg != progId` checks lets a malicious matcher over-fill, manipulate price, or re-enter core.
+
+**How to Prevent:**
+- Use **0-signer CPI-Out** from core to `matcherProg`: verify `takerOwner (S)` in core ONLY, NEVER pass `takerOwner` or core writable accounts to `matcherProg` — pass strictly `[matcherCtx (W, S=0)]` (+ optional readonly non-signer `extraAcc`).
+- Bind `lpPfl.matcherCtx` on the LP's portfolio so the LP retains 100% EOA custody (can revoke or withdraw directly at any time) and require `matcherCtx.owner == matcherProg`, `isExecutable matcherProg`, and `matcherProg != progId`.
+- Pass `reqSeq = preSeq + 1` in the CPI request (wrapping `UInt64` add satisfies `preSeq + 1 ≠ preSeq` unconditionally!) and require `magic == MAGIC_MRET ∧ status == 0 ∧ seq == reqSeq` post-CPI.
+- Support unified multi-market batching (`k ∈ [1..8]` distinct markets with `dupMarker == 0xFF` & distinct `marketId` checks) in ONE CPI so market makers see all offers atomically without tx introspection, while core enforces `0 < fillQty_i ≤ maxQty_i`, taker `limitPrice_i`, `maxMoveBps`, and atomic rollback across all `k` legs.
+
+**LiteSVM Test Recipe:**
+- Compile a real adversarial `evil_matcher.so` attacking all vectors (over-fill, abusive `limitPrice`, nonzero `status`, stale `seq` / `noop.so`, bad magic, zero fill, exceeding `maxMoveBps`, writing readonly `extraAcc`, aliased duplicate market in batch, self-CPI) and verify every attack reverts cleanly while multi-market correlated baskets succeed atomically.
+
+---
+
 ## Pre-Deployment Verification Checklist
 
 Before deploying any `lean-svm` program to devnet or mainnet:
