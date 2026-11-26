@@ -10,7 +10,7 @@ running it, not taken from the upstream README.
 |---|---|
 | `lake build` | Passes: 73 jobs, about 45 s. |
 | Compile all 8 examples to `.so` | All compile, and sizes match the upstream README byte-for-byte (`noop` 352 B … `lending` 12,320 B). |
-| LiteSVM runner (`svm-runner`) | **Not run in the reconnaissance environment**: crates.io was unreachable there. LEMMA's CI runs it. |
+| LiteSVM runner (`svm-runner`) | Not run in the reconnaissance environment (crates.io was unreachable). **Passes in LEMMA's CI** against LEMMA-built binaries. |
 | `sorry` / explicit `axiom` | None. |
 
 ## Axiom audit (all 621 theorems in `LeanSVM.*` and `Examples.*`)

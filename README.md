@@ -66,6 +66,11 @@ and a [draft upstream issue](docs/upstream/issue-nat-miscompilation.md).
 | 📐 **Test vectors** | [`vectors/*.json`](vectors), 10k cases from the integer specification | Replay them against *any* implementation (Rust, TypeScript, …). |
 | 🔒 **Proof-integrity audit** | `lake exe lemma-audit` | Fails on `sorry`, custom or native axioms, or `Nat` reachable from on-chain code. |
 
+**Verified on the real SVM (LiteSVM, in CI):** all 10,032 JSON vectors pass against the compiled
+programs (`mulDiv` ≤ 1,293 CU, swap ≤ 2,490 CU); every `GuardedCounter` attack is rejected (an honest
+call costs 72 CU, in a 1,216-byte `.so`); and an overflowing `Nat` addition aborts on Agave instead
+of wrapping, as patch 0001 requires.
+
 Every theorem has a plain-English statement in [`docs/specs/`](docs/specs/README.md), and everything
 that is **trusted rather than proven** is listed in [`trusted-base.md`](docs/specs/trusted-base.md).
 

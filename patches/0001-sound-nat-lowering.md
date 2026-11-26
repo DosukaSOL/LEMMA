@@ -75,9 +75,10 @@ result or aborts the transaction. An abort can never move funds or write state.
 
 - That `Lower.lean` emits exactly the proven schemes. That is shown by tests and review, not by
   proof; the compiler itself is not verified end to end.
-- Behaviour on the real Agave VM. The interpreter is a test oracle, not Agave. In particular, the
-  `abort` syscall was not executed on LiteSVM in this environment because crates.io was
-  unreachable. Re-run the LiteSVM suite before relying on it.
+- ~~Behaviour on the real Agave VM.~~ **Now verified in CI on LiteSVM:** the overflowing `Nat`
+  addition probe (`LemmaTest.ChainProbes.natAdd`) aborts with
+  `InstructionError(0, ProgramFailedToComplete)` ("SBF program panicked") instead of wrapping, while
+  exact sums succeed and wrong sums are rejected (`svm-runner/src/bin/lemma.rs`).
 - Compute-unit cost of the added checks (one compare-and-branch per `add`; a compare, a divide and a
   branch per `mul`).
 
