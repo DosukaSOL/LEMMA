@@ -490,4 +490,61 @@ def formatInsn : Insn → String
 def formatProgram (insns : Array Insn) : String :=
   String.intercalate "\n" (insns.toList.map formatInsn)
 
+/-! ### Clean-Room Assembler Slot & Byte-Size Soundness (0 `sorry`, 0 custom axioms) -/
+
+theorem pushRawInsn_size (buf : ByteArray) (opc dst src : UInt8) (off : Int16) (imm : UInt32) :
+    (pushRawInsn buf opc dst src off imm).size = buf.size + 8 := by
+  simp only [pushRawInsn, pushU16LE, pushU32LE, ByteArray.size_push]
+
+private theorem except_bind_ok {α β ε : Type} {x : Except ε α} {f : α → Except ε β} {r : β}
+    (h : (x >>= f) = .ok r) : ∃ a, x = .ok a ∧ f a = .ok r := by
+  cases x with
+  | error e => cases h
+  | ok a => exact ⟨a, rfl, h⟩
+
+private theorem list_forIn_except_inv {α σ ε : Type}
+    (xs : List α) (w : α → Nat) (body : α → σ → Except ε (ForInStep σ)) (Inv : Nat → σ → Prop)
+    (hStep : ∀ x k s step, Inv k s → body x s = .ok step →
+      ∃ s', step = .yield s' ∧ Inv (k + w x) s') :
+    ∀ k s out, Inv k s → forIn xs s body = .ok out → Inv (k + (xs.map w).sum) out := by
+  induction xs with
+  | nil =>
+    intro k s out hI h
+    change Except.ok s = Except.ok out at h
+    cases h
+    simpa using hI
+  | cons x tl ih =>
+    intro k s out hI h
+    rw [List.forIn_cons] at h
+    obtain ⟨step, hB, hRest⟩ := except_bind_ok h
+    obtain ⟨s', rfl, hI'⟩ := hStep x k s step hI hB
+    simpa [Nat.add_assoc] using ih (k + w x) s' out hI' hRest
+
+/-- Every successful sBPF assembly (`v0` or `v3`) emits exact `insnCount = ∑ Insn.slotCount`
+    and `bytes.size = 8 * insnCount` (zero Pass-1/Pass-2 PC drift or byte-alignment skew!). -/
+theorem assemble_slot_and_byte_size (insns : Array Insn) (ver : Version) (rodataBaseVaddr : UInt64)
+    (out : AssembledText) (h : assemble insns ver rodataBaseVaddr = .ok out) :
+    out.insnCount = (insns.toList.map (Insn.slotCount ver)).sum ∧
+    out.bytes.size = 8 * out.insnCount := by
+  unfold assemble at h
+  obtain ⟨_, _, h⟩ := except_bind_ok h
+  obtain ⟨st, hLoop, hRet⟩ := except_bind_ok h
+  cases hRet
+  rw [← Array.forIn_toList] at hLoop
+  let Inv : Nat → ByteArray × Array SyscallReloc × Array RodataFixup × Nat → Prop :=
+    fun k s => s.2.2.2 = k ∧ s.1.size = 8 * s.2.2.2
+  have hFinal : Inv (0 + (insns.toList.map (Insn.slotCount ver)).sum) st := by
+    refine list_forIn_except_inv insns.toList (Insn.slotCount ver) _ Inv ?_ 0 _ st ⟨rfl, rfl⟩ hLoop
+    intro insn k s step ⟨hk, hb⟩ hB
+    cases insn <;> dsimp only [Insn.slotCount] at hB ⊢
+    all_goals
+      simp only [bind, Except.bind, pure, Except.pure, throw, throwThe] at hB
+      repeat' split at hB
+      all_goals cases hB
+      all_goals
+        refine ⟨_, rfl, ?_⟩
+        simp only [Inv, pushRawInsn_size]
+        constructor <;> omega
+  simpa [Inv] using hFinal
+
 end LeanSVM.SBPF
