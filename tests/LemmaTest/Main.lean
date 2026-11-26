@@ -11,7 +11,7 @@ import LemmaTest.GuardTests
 open Lean LemmaTest
 
 def main : IO UInt32 := do
-  let env ← loadEnv #[`LemmaTest.NatProbes, `LemmaTest.MathProbes, `Lemma]
+  let env ← loadEnv #[`LemmaTest.NatProbes, `LemmaTest.MathProbes, `LemmaTest.ChainProbes, `Lemma]
   let ((), report) ← (do
       NatTests.suite env
       MathTests.suite env

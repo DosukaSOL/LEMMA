@@ -4,7 +4,7 @@
 
 Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 
-## LEMMA theorems (59)
+## LEMMA theorems (56)
 
 | Theorem | Axioms |
 |---|---|
@@ -30,9 +30,6 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 | `Lemma.Guard.requireSigner_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireTag_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireWritable_guard` | `Classical.choice`, `Quot.sound`, `propext` |
-| `Lemma.Math.Rounding.ceil.sizeOf_spec` | _(none)_ |
-| `Lemma.Math.Rounding.floor.sizeOf_spec` | _(none)_ |
-| `Lemma.Math.Rounding.ofNat_ctorIdx` | _(none)_ |
 | `Lemma.Math.Witnesses.fpMulM_can_succeed` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Math.Witnesses.mulDivCeilM_can_succeed` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Math.Witnesses.mulDivFloorM_can_succeed` | `Classical.choice`, `Quot.sound`, `propext` |

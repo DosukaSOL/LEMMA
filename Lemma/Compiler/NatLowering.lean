@@ -94,7 +94,7 @@ theorem trunc32_exact (v : UInt64) :
     BitVec.toNat_ofNatClamp
   rw [hc]
   by_cases h : v > 0xFFFFFFFF
-  · rw [if_pos h]; rw [GT.gt, UInt64.lt_iff_toNat_lt] at h; simp at h ⊢; omega
-  · rw [if_neg h]; rw [GT.gt, UInt64.lt_iff_toNat_lt] at h; simp at h ⊢; omega
+  · simp only [h, ↓reduceIte]; rw [GT.gt, UInt64.lt_iff_toNat_lt] at h; simp at h ⊢; omega
+  · simp only [h, ↓reduceIte]; rw [GT.gt, UInt64.lt_iff_toNat_lt] at h; simp at h ⊢; omega
 
 end Lemma.Compiler.NatLowering

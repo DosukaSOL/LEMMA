@@ -42,10 +42,10 @@ def p_chain (input : Ptr) : SolanaM Unit := do
   let (a, b, c) ← args input
   SolanaM.require ((a * b) / (b + 1) == c) Err.invalidArgument
 
-/-- `ofNatTruncate` must clamp, not mask. -/
+/-- `ofNatClamp` (formerly `ofNatTruncate`) must clamp, not mask. -/
 def p_trunc32 (input : Ptr) : SolanaM Unit := do
   let (a, b, c) ← args input
-  SolanaM.require ((UInt32.ofNatTruncate (a + b)).toNat == c) Err.invalidArgument
+  SolanaM.require ((UInt32.ofNatClamp (a + b)).toNat == c) Err.invalidArgument
 
 def predOrZero : Nat → Nat
   | 0 => 0

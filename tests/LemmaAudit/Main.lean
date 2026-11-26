@@ -41,7 +41,8 @@ def isLemmaModule (m : Name) : Bool := m.getRoot == `Lemma
 def isAuxName (n : Name) : Bool :=
   match n with
   | .str _ s => s.startsWith "eq_" || s == "eq_def" || s.startsWith "match_" ||
-      s.startsWith "proof_" || s.endsWith "_unfold" || s == "induct" || s.startsWith "_"
+      s.startsWith "proof_" || s.endsWith "_unfold" || s == "induct" || s.startsWith "_" ||
+      s == "sizeOf_spec" || s == "ofNat_ctorIdx" || s == "ctorIdx"
   | _ => true
 
 /-- `Spec` namespaces hold mathematical specifications (they may use `Nat` freely). -/

@@ -106,7 +106,7 @@ private theorem qr_spec (a b d : UInt64) (hd : d.toNat ≠ 0)
   obtain ⟨hab, _⟩ := wide_facts a b d hd
   by_cases h0 : (mulWide a b).1 = 0
   · have hw1 : (mulWide a b).1.toNat = 0 := by rw [h0]; rfl
-    simp only [h0, if_true]
+    simp only [h0, ite_true]
     rw [hab, hw1, Nat.zero_mul, Nat.zero_add]
     refine ⟨by rw [UInt64.toNat_div], ?_⟩
     generalize (mulWide a b).2 = L
@@ -118,7 +118,7 @@ private theorem qr_spec (a b d : UInt64) (hd : d.toNat ≠ 0)
     rw [Nat.mul_comm] at h1
     omega
   · have hlt : (mulWide a b).1.toNat < d.toNat := hfit.resolve_left h0
-    simp only [h0, if_false]
+    simp only [h0, ite_false]
     rw [hab]
     exact div128_spec _ _ d hlt
 
@@ -130,21 +130,21 @@ theorem mulDivFloor_spec (a b d q : UInt64) :
   · subst hd; simp
   have hdn : d.toNat ≠ 0 := fun h => hd ((toNat_eq_zero_iff d).mpr h)
   obtain ⟨hab, hfitIff⟩ := wide_facts a b d hdn
-  simp only [beq_iff_eq, hd, if_false]
+  simp only [beq_iff_eq, hd, ite_false]
   by_cases h0 : (mulWide a b).1 = 0
   · have hw1 : (mulWide a b).1.toNat = 0 := by rw [h0]; rfl
-    simp only [h0, if_true, Option.some.injEq]
+    simp only [h0, ite_true, Option.some.injEq]
     have hfit : a.toNat * b.toNat / d.toNat < 2^64 := hfitIff.mp (by omega)
     constructor
     · intro h; subst h; refine ⟨hdn, hfit, ?_⟩; rw [UInt64.toNat_div, hab, hw1]; simp
     · rintro ⟨_, _, hq⟩; apply UInt64.toNat_inj.mp; rw [hq, UInt64.toNat_div, hab, hw1]; simp
-  · simp only [h0, if_false]
+  · simp only [h0, ite_false]
     by_cases hge : (mulWide a b).1 ≥ d
-    · simp only [hge, if_true]
+    · simp only [hge, ite_true]
       have : ¬ a.toNat * b.toNat / d.toNat < 2^64 := by
         rw [← hfitIff]; rw [GE.ge, UInt64.le_iff_toNat_le] at hge; omega
       simp [this]
-    · simp only [hge, if_false, Option.some.injEq]
+    · simp only [hge, ite_false, Option.some.injEq]
       have hlt : (mulWide a b).1.toNat < d.toNat := by
         rw [GE.ge, UInt64.le_iff_toNat_le] at hge; omega
       obtain ⟨hq, _⟩ := div128_spec (mulWide a b).1 (mulWide a b).2 d hlt
@@ -186,9 +186,9 @@ theorem mulDivCeil_spec (a b d q : UInt64) :
   have hdpos : 0 < d.toNat := by omega
   obtain ⟨hab, hfitIff⟩ := wide_facts a b d hdn
   rw [ceilDiv_eq _ _ hdpos]
-  simp only [beq_iff_eq, hd, if_false]
+  simp only [beq_iff_eq, hd, ite_false]
   by_cases hbig : ((mulWide a b).1 != 0 && (mulWide a b).1 ≥ d) = true
-  · simp only [hbig, if_true]
+  · simp only [hbig, ite_true]
     simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, decide_eq_true_eq] at hbig
     have hge := hbig.2; rw [GE.ge, UInt64.le_iff_toNat_le] at hge
     have hnf : ¬ a.toNat * b.toNat / d.toNat < 2^64 := by rw [← hfitIff]; omega
@@ -196,7 +196,7 @@ theorem mulDivCeil_spec (a b d q : UInt64) :
         else a.toNat * b.toNat / d.toNat + 1) < 2^64 := by split <;> omega
     simp [this]
   · have hbig' : ((mulWide a b).1 != 0 && (mulWide a b).1 ≥ d) = false := by simpa using hbig
-    simp only [hbig', Bool.false_eq_true, if_false]
+    simp only [hbig', Bool.false_eq_true, ite_false]
     have hfit : (mulWide a b).1 = 0 ∨ (mulWide a b).1.toNat < d.toNat := by
       simp only [Bool.and_eq_false_iff, bne_eq_false_iff_eq, decide_eq_false_iff_not] at hbig'
       rcases hbig' with h | h
@@ -209,20 +209,20 @@ theorem mulDivCeil_spec (a b d q : UInt64) :
     have hqlt := q0.toNat_lt
     by_cases hr0 : r0 = 0
     · have hm : a.toNat * b.toNat % d.toNat = 0 := by rw [← hr, hr0]; rfl
-      simp only [hr0, if_true, hm, Option.some.injEq]
+      simp only [hr0, ite_true, hm, Option.some.injEq]
       constructor
       · intro h; subst h; exact ⟨hdn, by omega, hq⟩
       · rintro ⟨_, _, h⟩; exact UInt64.toNat_inj.mp (by rw [h, hq])
     · have hm : a.toNat * b.toNat % d.toNat ≠ 0 := by
         intro h; apply hr0; apply UInt64.toNat_inj.mp; rw [hr, h]; rfl
-      simp only [hr0, if_false, hm]
+      simp only [hr0, ite_false, hm]
       by_cases hmax : q0 = 0xFFFFFFFFFFFFFFFF
       · have : q0.toNat = 2^64 - 1 := by rw [hmax]; rfl
-        simp only [hmax, if_true]
+        simp only [hmax, ite_true]
         simp; omega
       · have hne : q0.toNat ≠ 2^64 - 1 := by
           intro h; apply hmax; apply UInt64.toNat_inj.mp; rw [h]; rfl
-        simp only [hmax, if_false, Option.some.injEq]
+        simp only [hmax, ite_false, Option.some.injEq]
         have hadd : (q0 + 1).toNat = q0.toNat + 1 := by
           rw [UInt64.toNat_add]; show (q0.toNat + 1) % 2^64 = _; omega
         constructor
@@ -239,7 +239,7 @@ theorem mulDivFloorM_eq (a b d : UInt64) (s : SvmState) :
   unfold mulDivFloorM mulDivFloor mulDivErr
   by_cases hd : d = 0
   · subst hd; rfl
-  simp only [beq_iff_eq, hd, if_false]
+  simp only [beq_iff_eq, hd, ite_false]
   by_cases h0 : (mulWide a b).1 = 0
   · simp [h0, SolanaM.pure]
   · by_cases hge : (mulWide a b).1 ≥ d
@@ -254,11 +254,11 @@ theorem mulDivCeilM_eq (a b d : UInt64) (s : SvmState) :
   unfold mulDivCeilM mulDivCeil mulDivErr
   by_cases hd : d = 0
   · subst hd; rfl
-  simp only [beq_iff_eq, hd, if_false]
+  simp only [beq_iff_eq, hd, ite_false]
   by_cases hbig : ((mulWide a b).1 != 0 && (mulWide a b).1 ≥ d) = true
-  · simp only [hbig, if_true]; rfl
+  · simp only [hbig, ite_true]; rfl
   · have hb : ((mulWide a b).1 != 0 && (mulWide a b).1 ≥ d) = false := by simpa using hbig
-    simp only [hb, Bool.false_eq_true, if_false]
+    simp only [hb, Bool.false_eq_true, ite_false]
     generalize (if (mulWide a b).1 = 0 then (mulWide a b).2 / d
       else div128 (mulWide a b).1 (mulWide a b).2 d) = q
     by_cases hr : (mulWide a b).2 - q * d = 0
@@ -269,30 +269,30 @@ theorem mulDivCeilM_eq (a b d : UInt64) (s : SvmState) :
 
 /-- On-chain `mulDivFloorM` succeeds with `q` iff the exact floor is defined, fits, and equals `q`. -/
 theorem mulDivFloorM_ok_iff (a b d q : UInt64) (s s' : SvmState) :
-    (∃ h : mulDivFloorM a b d s = .ok q s', True) ↔
+    mulDivFloorM a b d s = .ok q s' ↔
       s' = s ∧ d.toNat ≠ 0 ∧ a.toNat * b.toNat / d.toNat < 2^64 ∧
         q.toNat = a.toNat * b.toNat / d.toNat := by
   rw [mulDivFloorM_eq, ← mulDivFloor_spec]
-  cases h : mulDivFloor a b d with
+  cases mulDivFloor a b d with
   | none => simp
   | some q' =>
-    simp only [Option.some.injEq]
+    simp only [Option.some.injEq, SvmStep.ok.injEq]
     constructor
-    · rintro ⟨h, -⟩; cases h; exact ⟨rfl, rfl⟩
-    · rintro ⟨rfl, rfl⟩; exact ⟨rfl, trivial⟩
+    · rintro ⟨rfl, rfl⟩; exact ⟨rfl, rfl⟩
+    · rintro ⟨rfl, rfl⟩; exact ⟨rfl, rfl⟩
 
 /-- On-chain `mulDivCeilM` succeeds with `q` iff the exact ceiling is defined, fits, and equals `q`. -/
 theorem mulDivCeilM_ok_iff (a b d q : UInt64) (s s' : SvmState) :
-    (∃ h : mulDivCeilM a b d s = .ok q s', True) ↔
+    mulDivCeilM a b d s = .ok q s' ↔
       s' = s ∧ d.toNat ≠ 0 ∧ ceilDiv (a.toNat * b.toNat) d.toNat < 2^64 ∧
         q.toNat = ceilDiv (a.toNat * b.toNat) d.toNat := by
   rw [mulDivCeilM_eq, ← mulDivCeil_spec]
-  cases h : mulDivCeil a b d with
+  cases mulDivCeil a b d with
   | none => simp
   | some q' =>
-    simp only [Option.some.injEq]
+    simp only [Option.some.injEq, SvmStep.ok.injEq]
     constructor
-    · rintro ⟨h, -⟩; cases h; exact ⟨rfl, rfl⟩
-    · rintro ⟨rfl, rfl⟩; exact ⟨rfl, trivial⟩
+    · rintro ⟨rfl, rfl⟩; exact ⟨rfl, rfl⟩
+    · rintro ⟨rfl, rfl⟩; exact ⟨rfl, rfl⟩
 
 end Lemma.Math

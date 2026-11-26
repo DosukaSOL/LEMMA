@@ -2,6 +2,7 @@
 name = "svm-runner"
 version = "0.1.0"
 edition = "2021"
+default-run = "svm-runner"
 
 [dependencies]
 litesvm = "0.11.0"

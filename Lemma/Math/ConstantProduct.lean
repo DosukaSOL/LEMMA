@@ -49,7 +49,7 @@ theorem swapOutM_ok (x y amt fee out : UInt64) (s s' : SvmState)
   unfold inAfterFeeM at h
   by_cases hf : fee > bpsDenom
   · simp [hf, SolanaM.fail] at h
-  simp only [hf, if_false] at h
+  simp only [hf, ite_false] at h
   have hfee : fee.toNat ≤ 10000 := by
     rw [GT.gt, UInt64.lt_iff_toNat_lt, toNat_bps] at hf; omega
   have hsub : (bpsDenom - fee).toNat = 10000 - fee.toNat := by
@@ -57,13 +57,13 @@ theorem swapOutM_ok (x y amt fee out : UInt64) (s s' : SvmState)
   split at h
   · rename_i aif s1 h1
     obtain ⟨rfl, -, -, haif⟩ :=
-      (mulDivFloorM_ok_iff amt (bpsDenom - fee) bpsDenom aif s s1).mp ⟨h1, trivial⟩
+      (mulDivFloorM_ok_iff amt (bpsDenom - fee) bpsDenom aif s s1).mp h1
     rw [hsub, toNat_bps] at haif
     -- checked add step
     unfold checkedAdd64 at h
     simp only [Bind.bind, SolanaM.bind, SolanaM.require, Pure.pure, SolanaM.pure] at h
     by_cases hov : x + aif ≥ x
-    · simp only [hov, decide_true, if_true] at h
+    · simp only [hov, decide_true, ite_true] at h
       have hno : x.toNat + aif.toNat < 2^64 := by
         rw [GE.ge, UInt64.le_iff_toNat_le, UInt64.toNat_add] at hov
         have := x.toNat_lt; have := aif.toNat_lt
@@ -72,7 +72,7 @@ theorem swapOutM_ok (x y amt fee out : UInt64) (s s' : SvmState)
         · exfalso; rw [Nat.mod_eq_sub_mod h', Nat.mod_eq_of_lt (by omega)] at hov; omega
       have hadd : (x + aif).toNat = x.toNat + aif.toNat := by
         rw [UInt64.toNat_add, Nat.mod_eq_of_lt hno]
-      obtain ⟨rfl, hd, -, hout⟩ := (mulDivFloorM_ok_iff y aif (x + aif) out _ s').mp ⟨h, trivial⟩
+      obtain ⟨rfl, hd, -, hout⟩ := (mulDivFloorM_ok_iff y aif (x + aif) out _ s').mp h
       rw [hadd] at hd hout
       exact ⟨aif, rfl, hfee, haif, hno, hd, hout⟩
     · simp [hov, SolanaM.fail] at h

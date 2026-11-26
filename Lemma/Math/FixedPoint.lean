@@ -23,7 +23,7 @@ open LeanSVM Spec
 theorem mulDivFloorM_bounds (a b d q : UInt64) (s s' : SvmState)
     (h : mulDivFloorM a b d s = .ok q s') :
     q.toNat * d.toNat ≤ a.toNat * b.toNat ∧ a.toNat * b.toNat < (q.toNat + 1) * d.toNat := by
-  obtain ⟨-, hd, -, hq⟩ := (mulDivFloorM_ok_iff a b d q s s').mp ⟨h, trivial⟩
+  obtain ⟨-, hd, -, hq⟩ := (mulDivFloorM_ok_iff a b d q s s').mp h
   rw [hq]
   refine ⟨Nat.div_mul_le_self _ _, ?_⟩
   rw [Nat.add_mul, Nat.one_mul]
@@ -37,7 +37,7 @@ theorem mulDivFloorM_bounds (a b d q : UInt64) (s s' : SvmState)
 theorem mulDivCeilM_bounds (a b d q : UInt64) (s s' : SvmState)
     (h : mulDivCeilM a b d s = .ok q s') :
     a.toNat * b.toNat ≤ q.toNat * d.toNat ∧ q.toNat * d.toNat < a.toNat * b.toNat + d.toNat := by
-  obtain ⟨-, hd, -, hq⟩ := (mulDivCeilM_ok_iff a b d q s s').mp ⟨h, trivial⟩
+  obtain ⟨-, hd, -, hq⟩ := (mulDivCeilM_ok_iff a b d q s s').mp h
   rw [hq]; unfold ceilDiv
   generalize a.toNat * b.toNat = X
   generalize hD : d.toNat = D at hd

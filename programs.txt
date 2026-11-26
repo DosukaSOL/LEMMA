@@ -10,3 +10,7 @@ Examples.DutchAuction        Examples.DutchAuction.entrypoint         dutch_auct
 Examples.BondingCurve        Examples.BondingCurve.entrypoint         bonding_curve
 # ── LEMMA programs ──
 Lemma.Examples.GuardedCounter Lemma.Examples.GuardedCounter.entrypoint  guarded_counter
+# ── LEMMA test probes for the real SVM (svm-runner/src/bin/lemma.rs) ──
+LemmaTest.ChainProbes        LemmaTest.ChainProbes.mulDiv             probe_muldiv
+LemmaTest.ChainProbes        LemmaTest.ChainProbes.swap               probe_swap
+LemmaTest.ChainProbes        LemmaTest.ChainProbes.natAdd             probe_nat_add

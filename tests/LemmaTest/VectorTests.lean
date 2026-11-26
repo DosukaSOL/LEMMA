@@ -5,6 +5,7 @@
 -/
 import Lean.Data.Json
 import LemmaTest.Harness
+import LemmaTest.Abi
 
 namespace LemmaTest.VectorTests
 open Lean LemmaTest
@@ -32,7 +33,7 @@ def expectedHalt (j : Json) : Except String (Option UInt64 × Sbpf.Halt) := do
     | none => throw s!"unknown error kind {e}"
 
 def replay (env : Environment) (path : String) (probe : Name)
-    (encode : Json → Except String ByteArray) : TestM Unit := do
+    (encode : Json → Except String ByteArray) (abi : Bool := false) : TestM Unit := do
   let txt ← IO.FS.readFile path
   match Json.parse txt >>= (·.getObjVal? "cases") >>= (·.getArr?) with
   | .error e => check false fun _ => s!"{path}: cannot parse: {e}"
@@ -45,15 +46,17 @@ def replay (env : Environment) (path : String) (probe : Name)
         match expectedHalt c, encode c with
         | .ok (v?, want), .ok inp =>
           let cval := v?.getD 0
-          let (halt, _) := prog.run (inp ++ u64le cval)
+          let wrap (bs : ByteArray) : ByteArray :=
+            if abi then (Abi.serialize [] bs (Abi.key32 0xA0)).1 else bs
+          let (halt, _) := prog.run (wrap (inp ++ u64le cval))
           n := n + 1
           check (halt == want) fun _ => s!"{path} case {c.compress}: want {repr want}, got {repr halt}"
           -- a wrong value must be detected too (guards against a probe that always succeeds)
           if let some v := v? then
-            let (halt2, _) := prog.run (inp ++ u64le (v + 1))
+            let (halt2, _) := prog.run (wrap (inp ++ u64le (v + 1)))
             check (halt2 == .exit 0xBAD) fun _ => s!"{path} case {c.compress}: wrong value accepted"
         | .error e, _ | _, .error e => check false fun _ => s!"{path}: bad case {c.compress}: {e}"
-      IO.println s!"   {path}: {n} vectors replayed against compiled {probe}"
+      IO.println s!"   {path}: {n} vectors replayed against compiled {probe}{if abi then " (ABI-serialized input)" else ""}"
 
 def suite (env : Environment) : TestM Unit := do
   section_ "JSON test vectors replayed against compiled programs (interpreter)"
@@ -62,6 +65,14 @@ def suite (env : Environment) : TestM Unit := do
       pure (u64le (← getU64 j "a") ++ u64le (← getU64 j "b") ++ u64le (← getU64 j "d") ++
         ⟨#[if ceil then 1 else 0, 0, 0, 0, 0, 0, 0, 0]⟩)
   replay env "vectors/swapOut.json" `LemmaTest.MathProbes.p_swap fun j => do
+    pure (u64le (← getU64 j "reserveIn") ++ u64le (← getU64 j "reserveOut") ++
+      u64le (← getU64 j "amountIn") ++ u64le (← getU64 j "feeBps"))
+  -- the real-SVM probes (same programs the LiteSVM job runs), with ABI-serialized input
+  for (path, ceil) in [("vectors/mulDivFloor.json", false), ("vectors/mulDivCeil.json", true)] do
+    replay env path `LemmaTest.ChainProbes.mulDiv (abi := true) fun j => do
+      pure (u64le (← getU64 j "a") ++ u64le (← getU64 j "b") ++ u64le (← getU64 j "d") ++
+        ⟨#[if ceil then 1 else 0]⟩)
+  replay env "vectors/swapOut.json" `LemmaTest.ChainProbes.swap (abi := true) fun j => do
     pure (u64le (← getU64 j "reserveIn") ++ u64le (← getU64 j "reserveOut") ++
       u64le (← getU64 j "amountIn") ++ u64le (← getU64 j "feeBps"))
 

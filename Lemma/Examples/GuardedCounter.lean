@@ -48,7 +48,7 @@ open LeanSVM Lemma.Guard Lemma.Spec
 theorem nextCursor_state (acc : AccountView) (s s' : SvmState) (p : Ptr)
     (h : AccountView.nextCursor acc s = .ok p s') : s' = s := by
   unfold AccountView.nextCursor at h
-  simp only [Bind.bind, SolanaM.bind, rawLoadU8, rawLoadU64, Pure.pure, SolanaM.pure] at h
+  simp only [Bind.bind, SolanaM.bind, rawLoadU8] at h
   split at h <;> cases h <;> rfl
 
 theorem skipAccounts_state : ∀ (n : Nat) (c rem : UInt64) (s s' : SvmState) (p : Ptr),
@@ -59,9 +59,9 @@ theorem skipAccounts_state : ∀ (n : Nat) (c rem : UInt64) (s s' : SvmState) (p
   · intro c rem s s' p hn h
     rw [Input.skipAccounts] at h
     by_cases h0 : rem = 0
-    · rw [dif_pos h0] at h
+    · simp only [h0, ↓reduceDIte] at h
       simp only [Pure.pure, SolanaM.pure] at h; cases h; rfl
-    · rw [dif_neg h0] at h
+    · simp only [h0, ↓reduceDIte] at h
       simp only [Bind.bind, SolanaM.bind] at h
       split at h
       · rename_i q s1 hq
