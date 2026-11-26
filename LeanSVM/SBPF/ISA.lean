@@ -48,6 +48,12 @@ inductive AluOp where
   | add | sub | mul | div | or | and | lsh | rsh | mod | xor | mov | arsh
   deriving Repr, BEq, DecidableEq
 
+/-- True iff Solana sBPF (both v0 and v3) sign-extends the 32-bit result of `op` into
+    bits `32..63` (`i32 → i64 → u64`) instead of zero-extending (`u32 → u64`). -/
+def AluOp.signExtendsInAlu32 : AluOp → Bool
+  | .add | .sub | .mul => true
+  | _ => false
+
 /-- Conditional jump predicate. -/
 inductive JmpCond where
   | eq | gt | ge | set | ne | sgt | sge | lt | le | slt | sle
@@ -141,7 +147,7 @@ def pushRawInsn (buf : ByteArray) (opc : UInt8) (dst src : UInt8) (off : Int16) 
 
 /-! ### Exact Solana sBPF Opcode Tables -/
 
-private def aluBaseOpc : AluOp → UInt8
+def aluBaseOpc : AluOp → UInt8
   | .add  => 0x00
   | .sub  => 0x10
   | .mul  => 0x20
@@ -168,51 +174,60 @@ private def jmpBaseOpc : JmpCond → UInt8
   | .slt => 0xc0
   | .sle => 0xd0
 
-private def ldxOpc (ver : Version) : MemSize → UInt8
+def ldxOpc (ver : Version) : MemSize → UInt8
   | .b1 => match ver with | .v0 => 0x71 | .v3 => 0x2c
   | .b2 => match ver with | .v0 => 0x69 | .v3 => 0x3c
   | .b4 => match ver with | .v0 => 0x61 | .v3 => 0x8c
   | .b8 => match ver with | .v0 => 0x79 | .v3 => 0x9c
 
-private def stxOpc (ver : Version) : MemSize → UInt8
+def stxOpc (ver : Version) : MemSize → UInt8
   | .b1 => match ver with | .v0 => 0x73 | .v3 => 0x2f
   | .b2 => match ver with | .v0 => 0x6b | .v3 => 0x3f
   | .b4 => match ver with | .v0 => 0x63 | .v3 => 0x8f
   | .b8 => match ver with | .v0 => 0x7b | .v3 => 0x9f
 
-private def stImmOpc (ver : Version) : MemSize → UInt8
+def stImmOpc (ver : Version) : MemSize → UInt8
   | .b1 => match ver with | .v0 => 0x72 | .v3 => 0x27
   | .b2 => match ver with | .v0 => 0x6a | .v3 => 0x37
   | .b4 => match ver with | .v0 => 0x62 | .v3 => 0x87
   | .b8 => match ver with | .v0 => 0x7a | .v3 => 0x97
 
-private def alu64RegOpc (ver : Version) (op : AluOp) : UInt8 :=
+def alu64RegOpc (ver : Version) (op : AluOp) : UInt8 :=
   match ver, op with
   | .v3, .mul => 0x9e  -- LMUL64_REG (BPF_PQR | BPF_B | BPF_X | BPF_LMUL)
   | .v3, .div => 0x5e  -- UDIV64_REG
   | .v3, .mod => 0x7e  -- UREM64_REG
   | _,   _    => aluBaseOpc op ||| 0x0f -- BPF_ALU64 | BPF_X
 
-private def alu64ImmOpc (ver : Version) (op : AluOp) : UInt8 :=
+def alu64ImmOpc (ver : Version) (op : AluOp) : UInt8 :=
   match ver, op with
   | .v3, .mul => 0x96  -- LMUL64_IMM
   | .v3, .div => 0x56  -- UDIV64_IMM
   | .v3, .mod => 0x76  -- UREM64_IMM
   | _,   _    => aluBaseOpc op ||| 0x07 -- BPF_ALU64 | BPF_K
 
-private def alu32RegOpc (ver : Version) (op : AluOp) : UInt8 :=
+def alu32RegOpc (ver : Version) (op : AluOp) : UInt8 :=
   match ver, op with
   | .v3, .mul => 0x8e  -- LMUL32_REG
   | .v3, .div => 0x4e  -- UDIV32_REG
   | .v3, .mod => 0x6e  -- UREM32_REG
   | _,   _    => aluBaseOpc op ||| 0x0c -- BPF_ALU32 | BPF_X
 
-private def alu32ImmOpc (ver : Version) (op : AluOp) : UInt8 :=
+def alu32ImmOpc (ver : Version) (op : AluOp) : UInt8 :=
   match ver, op with
   | .v3, .mul => 0x86  -- LMUL32_IMM
   | .v3, .div => 0x46  -- UDIV32_IMM
   | .v3, .mod => 0x66  -- UREM32_IMM
   | _,   _    => aluBaseOpc op ||| 0x04 -- BPF_ALU32 | BPF_K
+
+/-- Opcode for unary 64-bit negation (`dst = -dst`):
+    - sBPF v0: `0x87` (`NEG64`)
+    - sBPF v3: `0x17` (`SUB64_IMM dst, 0` computes `0 - dst` under SIMD-0174, avoiding the
+      reassigned `0x87 = ST_4B_IMM` opcode removed by SIMD-0173!). -/
+def neg64Opc (ver : Version) : UInt8 :=
+  match ver with
+  | .v0 => 0x87
+  | .v3 => 0x17
 
 /-! ### Murmur3-32 Hasher (exact match to Solana `ebpf::hash_symbol_name`) -/
 
@@ -314,16 +329,31 @@ def assemble (insns : Array Insn) (ver : Version := .v0) (rodataBaseVaddr : UInt
       buf := pushRawInsn buf (alu64RegOpc ver op) dst.idx src.idx 0 0
       curPc := curPc + 1
     | .alu64Imm op dst imm =>
-      buf := pushRawInsn buf (alu64ImmOpc ver op) dst.idx 0 0 imm.toUInt32
+      if ver == .v3 && op == .sub then
+        -- Under sBPF v2/v3 (SIMD-0174), `SUB64_IMM` (0x17) computes `imm - dst` rather than `dst - imm`.
+        -- Rewrite `dst - imm` into `ADD64_IMM dst, (-imm)` when `-imm` fits in Int32; reject `Int32.minValue`.
+        if imm.toInt == -2147483648 then
+          throw "sBPF v3: alu64Imm .sub with Int32.minValue cannot be lowered in 1 slot"
+        let negImm : Int32 := Int32.ofInt (-imm.toInt)
+        buf := pushRawInsn buf (alu64ImmOpc ver .add) dst.idx 0 0 negImm.toUInt32
+      else
+        buf := pushRawInsn buf (alu64ImmOpc ver op) dst.idx 0 0 imm.toUInt32
       curPc := curPc + 1
     | .alu32Reg op dst src =>
       buf := pushRawInsn buf (alu32RegOpc ver op) dst.idx src.idx 0 0
       curPc := curPc + 1
     | .alu32Imm op dst imm =>
-      buf := pushRawInsn buf (alu32ImmOpc ver op) dst.idx 0 0 imm.toUInt32
+      if ver == .v3 && op == .sub then
+        -- Under sBPF v2/v3 (SIMD-0174), `SUB32_IMM` (0x14) computes `imm - dst`.
+        if imm.toInt == -2147483648 then
+          throw "sBPF v3: alu32Imm .sub with Int32.minValue cannot be lowered in 1 slot"
+        let negImm : Int32 := Int32.ofInt (-imm.toInt)
+        buf := pushRawInsn buf (alu32ImmOpc ver .add) dst.idx 0 0 negImm.toUInt32
+      else
+        buf := pushRawInsn buf (alu32ImmOpc ver op) dst.idx 0 0 imm.toUInt32
       curPc := curPc + 1
     | .neg64 dst =>
-      buf := pushRawInsn buf 0x87 dst.idx 0 0 0
+      buf := pushRawInsn buf (neg64Opc ver) dst.idx 0 0 0
       curPc := curPc + 1
     | .lddw dst imm =>
       match ver with

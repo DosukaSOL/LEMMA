@@ -11,6 +11,7 @@ import LeanSVM.Compiler.Lower
 import LeanSVM.Compiler.Optimize
 import LeanSVM.Compiler.RegAlloc
 import LeanSVM.Compiler.CodeGen
+import LeanSVM.Compiler.Validate
 import LeanSVM.SBPF.ISA
 import LeanSVM.SBPF.ELF
 
@@ -51,17 +52,33 @@ def compileEntrypoint (env : Environment) (entryName : Name) (opts : CompileOpti
       String.intercalate "\n\n" ((prog.entry :: prog.helpers.toList).map formatFunc)
     else ""
 
-  -- Stage 2: Aggressive SSA IR Optimization (ConstFold, AddrFold, StackFold, StoreImm, CSE, TailMerge, DCE)
+  -- Stage 2: Aggressive SSA IR Optimization (ConstFold, VRange, AddrFold, StackFold, StoreImm, CSE, TailMerge, DCE)
+  --          + Interprocedural Dead Helper Elimination
   let optEntry := optimizeFunc prog.entry
   let optHelpers := prog.helpers.map optimizeFunc
-  let optProg : Program := { entry := optEntry, helpers := optHelpers, rodata := prog.rodata }
+  let optProg : Program := removeDeadHelpers { entry := optEntry, helpers := optHelpers, rodata := prog.rodata }
   let optIrDump :=
     if opts.dumpIR then
       String.intercalate "\n\n" ((optProg.entry :: optProg.helpers.toList).map formatFunc)
     else ""
 
-  -- Stage 3: Coalescing Linear-Scan Register Allocation + Direct sBPF CodeGen + Peephole Optimization
-  let (insns, alloc, helperCount) := generateProgramCode optProg
+  -- Stage 3: Formally Verified Translation Validation (CFG, Immediates, Liveness & RegAlloc)
+  --          + Direct sBPF CodeGen + Peephole Optimization
+  validateProgramCFG optProg
+  let entryAlloc := allocateRegisters optProg.entry
+  validateFuncAlloc optProg.entry entryAlloc
+  let mut allInsns := generateFuncCodeWithAlloc optProg.entry entryAlloc
+  let mut maxStack := entryAlloc.totalStackBytes
+  let mut totalSpills := entryAlloc.spillCount
+  for h in optProg.helpers do
+    let hAlloc := allocateRegisters h
+    validateFuncAlloc h hAlloc
+    allInsns := allInsns ++ generateFuncCodeWithAlloc h hAlloc
+    maxStack := max maxStack hAlloc.totalStackBytes
+    totalSpills := totalSpills + hAlloc.spillCount
+  let insns := SBPF.peepholeOptimize allInsns
+  let alloc : AllocResult := { entryAlloc with totalStackBytes := maxStack, spillCount := totalSpills }
+  let helperCount := optProg.helpers.size
   let asmDump := if opts.dumpAsm then SBPF.formatProgram insns else ""
 
   -- Stage 4: Direct Native ELF64 `.so` Linking & Serialization

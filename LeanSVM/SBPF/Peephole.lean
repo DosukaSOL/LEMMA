@@ -57,6 +57,7 @@ def overwritesRegWithoutReading (r : Reg) : Insn → Bool
   | .lddw d _ => d == r
   | .lddwRodata d _ => d == r
   | .alu64Reg .mov d s => d == r && s != r
+  | .alu32Reg .mov d s => d == r && s != r
   | .ldx _ d base _ => d == r && base != r
   | _ => false
 
@@ -160,6 +161,22 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
             changed := true
             i := i + 3
             continue
+        -- Zero-extending copy narrowing on exit: `mov32 x, x; mov64 r0, x; exit` -> `mov32 r0, x; exit`!
+        | .alu32Reg .mov x x1, .alu64Reg .mov d x2, .exit =>
+          if d == Reg.r0 && x == x1 && x == x2 then
+            out := out.push (.alu32Reg .mov Reg.r0 x) |>.push .exit
+            dead := true
+            changed := true
+            i := i + 3
+            continue
+        -- Zero-extending copy narrowing when source `x` is dead:
+        -- `mov32 x, x; mov64 d, x; nxt` (where `nxt` overwrites `x` without reading `x`) -> `mov32 d, x; nxt`!
+        | .alu32Reg .mov x x1, .alu64Reg .mov d x2, _ =>
+          if x == x1 && x == x2 && d != x && overwritesRegWithoutReading x nxt2 then
+            out := out.push (.alu32Reg .mov d x)
+            changed := true
+            i := i + 2
+            continue
         -- Branch-over-jump inversion: `jcc cond, L1; ja L2; L1:` -> `jcc (invert cond), L2; L1:`!
         | .jccReg cond d s l1, .ja l2, .label l1' =>
           if l1 == l1' then
@@ -244,6 +261,28 @@ private def peepholePass (insns : Array Insn) : Array Insn × Bool := Id.run do
               changed := true
               i := i + 2
               continue
+        -- Redundant `mov32 d, d` after an instruction that ALREADY zero-extends `d` to 32 bits:
+        -- 1. Narrow loads (`ldxb`/`ldxh`/`ldxw`) already zero-extend bits 32..63.
+        | .ldx sz d _ _, .alu32Reg .mov d2 d3 =>
+          if sz != .b8 && d == d2 && d2 == d3 then
+            out := out.push shrunk
+            changed := true
+            i := i + 2
+            continue
+        -- 2. Non-sign-extending `alu32Reg` (incl. `mov32`, `and32`, `or32`, `xor32`, `lsh32`, `rsh32`, `div32`, `mod32`)
+        | .alu32Reg op d _, .alu32Reg .mov d2 d3 =>
+          if !op.signExtendsInAlu32 && d == d2 && d2 == d3 then
+            out := out.push shrunk
+            changed := true
+            i := i + 2
+            continue
+        -- 3. Non-sign-extending `alu32Imm` (incl. `mov32 imm`)
+        | .alu32Imm op d _, .alu32Reg .mov d2 d3 =>
+          if !op.signExtendsInAlu32 && d == d2 && d2 == d3 then
+            out := out.push shrunk
+            changed := true
+            i := i + 2
+            continue
         -- `add64 r, k1; add64 r, k2` -> combine immediates!
         | .alu64Imm .add r1 k1, .alu64Imm .add r2 k2 =>
           if r1 == r2 then

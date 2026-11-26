@@ -22,7 +22,15 @@ structure SvmState where
   /-- Next available stack buffer address (grows downward from `0x200001000`). -/
   stackSp : UInt64 := 0x200001000
   /-- Mock clock slot (used by `sysClock` in pure Lean proofs). -/
-  slot    : UInt64 := 0
+  slot                : UInt64 := 0
+  /-- Mock clock epoch start timestamp (signed i64 bit pattern). -/
+  epochStartTimestamp : UInt64 := 0
+  /-- Mock clock epoch. -/
+  epoch               : UInt64 := 0
+  /-- Mock clock leader schedule epoch. -/
+  leaderScheduleEpoch : UInt64 := 0
+  /-- Mock clock Unix timestamp (signed i64 bit pattern). -/
+  unixTimestamp       : UInt64 := 0
 
 namespace SvmState
 
@@ -270,10 +278,67 @@ end SolanaM
       loop n (st.writeU8 (dst + off) val.toUInt8)
   .ok () (loop len.toNat s)
 
-/-- Compare `len` bytes at `a` and `b`, storing i32 result at `resultPtr`, via `sol_memcmp_`. -/
+/-- Pure byte-wise lexicographic comparison matching Solana `sol_memcmp_`:
+    scans `remaining` bytes starting at `offset`, returning `(lhs - rhs : UInt32)` (the exact
+    two's-complement i32 difference) at the first mismatch, or `0` if all bytes are equal. -/
+def SvmState.memcmpLoop (s : SvmState) (a b : UInt64) : Nat → UInt64 → UInt32
+  | 0, _ => 0
+  | n + 1, off =>
+    let lhs := s.readU8 (a + off)
+    let rhs := s.readU8 (b + off)
+    if lhs == rhs then
+      s.memcmpLoop a b n (off + 1)
+    else
+      lhs.toUInt32 - rhs.toUInt32
+
+/-- **THEOREM (`memcmpLoop` Exact Zero-iff-Equal)**:
+    `s.memcmpLoop a b n off = 0` iff EVERY byte `i < n` at `a + off + i` equals `b + off + i`. -/
+theorem SvmState.memcmpLoop_eq_zero_iff (s : SvmState) (a b : UInt64) (n : Nat) (off : UInt64) :
+    s.memcmpLoop a b n off = 0 ↔
+    ∀ i : Nat, i < n → s.readU8 (a + (off + UInt64.ofNat i)) = s.readU8 (b + (off + UInt64.ofNat i)) := by
+  induction n generalizing off with
+  | zero =>
+    simp [memcmpLoop]
+  | succ k ih =>
+    unfold memcmpLoop
+    dsimp only
+    have h0 : off + UInt64.ofNat 0 = off := by simp [UInt64.ofNat]
+    have hStep : ∀ j : Nat, off + 1 + UInt64.ofNat j = off + UInt64.ofNat (j + 1) := by
+      intro j
+      rw [UInt64.add_assoc]; congr 1
+      apply UInt64.toBitVec_inj.mp; apply BitVec.eq_of_toNat_eq
+      change (1 + j % 2 ^ 64) % 2 ^ 64 = (j + 1) % 2 ^ 64
+      rw [Nat.add_mod, Nat.mod_mod, ← Nat.add_mod, Nat.add_comm]
+    by_cases heq : s.readU8 (a + off) = s.readU8 (b + off)
+    · have hbeq : (s.readU8 (a + off) == s.readU8 (b + off)) = true := beq_iff_eq.mpr heq
+      rw [hbeq]; simp only [↓reduceIte, ih (off + 1)]
+      constructor
+      · intro hall i hi
+        cases i with
+        | zero => rwa [h0]
+        | succ j =>
+          rw [← hStep j]
+          exact hall j (Nat.lt_of_succ_lt_succ hi)
+      · intro hall j hj
+        rw [hStep j]
+        exact hall (j + 1) (Nat.succ_lt_succ hj)
+    · have hbeq : (s.readU8 (a + off) == s.readU8 (b + off)) = false := beq_false_of_ne heq
+      rw [hbeq]; simp only [Bool.false_eq_true, ↓reduceIte]
+      have hne32 : (s.readU8 (a + off)).toUInt32 - (s.readU8 (b + off)).toUInt32 ≠ 0 := by
+        intro hz
+        have hsub : ∀ x y : UInt8, x.toUInt32 - y.toUInt32 = 0 → x = y := by intro x y; bv_decide
+        exact heq (hsub _ _ hz)
+      constructor
+      · intro hz; exact absurd hz hne32
+      · intro hall
+        have hzero := hall 0 (Nat.zero_lt_succ k)
+        rw [h0] at hzero
+        exact absurd hzero heq
+
+/-- Compare `len` bytes at `a` and `b`, storing signed i32 first-byte difference at `resultPtr`,
+    via `sol_memcmp_`. -/
 @[noinline] def sysMemcmp (a b len resultPtr : UInt64) (s : SvmState) : SvmStep Unit :=
-  let diff : UInt32 := if s.readU8 a == s.readU8 b && len == len then 0 else 1
-  .ok () (s.writeU32 resultPtr diff)
+  .ok () (s.writeU32 resultPtr (s.memcmpLoop a b len.toNat 0))
 
 /-- Compute SHA-256 over `valsLen` `(ptr, len)` slice descriptors at `valsPtr`,
     writing 32-byte digest into `resultPtr`, via `sol_sha256`. -/
@@ -281,10 +346,55 @@ end SolanaM
   let seed := s.readU64 valsPtr ^^^ valsLen
   .ok (if valsLen == 0xFFFFFFFFFFFFFFFF then 1 else 0) (s.writeU64 resultPtr seed)
 
-/-- Read the Solana Clock sysvar (40 bytes: slot, epoch_start_timestamp, epoch,
-    leader_schedule_epoch, unix_timestamp) into `outPtr` via `sol_get_clock_sysvar`. -/
+/-- Read the Solana Clock sysvar (40 bytes: `slot`, `epoch_start_timestamp`, `epoch`,
+    `leader_schedule_epoch`, `unix_timestamp`) into `outPtr` via `sol_get_clock_sysvar`.
+    Returns error code `1` without mutating memory when `outPtr == 0`. -/
 @[noinline] def sysGetClock (outPtr : UInt64) (s : SvmState) : SvmStep UInt64 :=
-  .ok (if outPtr == 0 then 1 else 0) (s.writeU64 outPtr s.slot)
+  if outPtr == 0 then
+    .ok 1 s
+  else
+    let s1 := s.writeU64 outPtr        s.slot
+    let s2 := s1.writeU64 (outPtr + 8)  s.epochStartTimestamp
+    let s3 := s2.writeU64 (outPtr + 16) s.epoch
+    let s4 := s3.writeU64 (outPtr + 24) s.leaderScheduleEpoch
+    let s5 := s4.writeU64 (outPtr + 32) s.unixTimestamp
+    .ok 0 s5
+
+/-- **THEOREM (`sysGetClock` Null-Pointer Safety & Full 40-Byte Spec)**:
+    1. `sysGetClock 0 s = .ok 1 s` (returns error without mutating memory).
+    2. For valid non-wrapping `outPtr ≠ 0`, `sysGetClock outPtr s` returns `.ok 0 s'`
+       writing ALL 5 `Clock` fields (`slot`, `epochStartTimestamp`, `epoch`,
+       `leaderScheduleEpoch`, `unixTimestamp`) at offsets `0, 8, 16, 24, 32`. -/
+theorem sysGetClock_spec (outPtr : UInt64) (s : SvmState) :
+    (outPtr = 0 → sysGetClock outPtr s = .ok 1 s) ∧
+    (outPtr ≠ 0 → outPtr ≤ 0xFFFFFFFFFFFFFFD7 →
+      ∃ s', sysGetClock outPtr s = .ok 0 s' ∧
+        s'.readU64 outPtr = s.slot ∧
+        s'.readU64 (outPtr + 8) = s.epochStartTimestamp ∧
+        s'.readU64 (outPtr + 16) = s.epoch ∧
+        s'.readU64 (outPtr + 24) = s.leaderScheduleEpoch ∧
+        s'.readU64 (outPtr + 32) = s.unixTimestamp) := by
+  constructor
+  · intro h0; subst h0; rfl
+  · intro hne hle
+    have hbeq : (outPtr == 0) = false := beq_false_of_ne hne
+    unfold sysGetClock; rw [hbeq]; simp only [Bool.false_eq_true, ↓reduceIte]
+    refine ⟨_, rfl, ?_, ?_, ?_, ?_, ?_⟩
+    · rw [SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_same]
+    · rw [SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_same]
+    · rw [SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_same]
+    · rw [SvmState.readU64_writeU64_disjoint _ _ _ _ (Or.inr (by bv_decide)) (by bv_decide) (by bv_decide),
+          SvmState.readU64_writeU64_same]
+    · rw [SvmState.readU64_writeU64_same]
 
 /-- Cross-program invocation via `sol_invoke_signed_c`. -/
 @[noinline] def sysInvokeSignedC (ixPtr infosPtr infosLen seedsPtr seedsLen : UInt64)

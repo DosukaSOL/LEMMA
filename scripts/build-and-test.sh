@@ -14,6 +14,7 @@ lake exe lean-svm build Examples.Amm          Examples.Amm.entrypoint          -
 lake exe lean-svm build Examples.Lending      Examples.Lending.entrypoint      -o build/lending.so
 lake exe lean-svm build Examples.DutchAuction Examples.DutchAuction.entrypoint -o build/dutch_auction.so
 lake exe lean-svm build Examples.BondingCurve Examples.BondingCurve.entrypoint -o build/bonding_curve.so
+lake exe lean-svm build Examples.CompilerRegression Examples.CompilerRegression.entrypoint -o build/compiler_regression.so
 
 echo "=== 3. Compile hand-rolled #![no_std] Rust baselines (if Solana platform-tools installed) ==="
 SOLANA_TOOLS="${SOLANA_TOOLS:-$HOME/.cache/solana/v1.58/platform-tools}"

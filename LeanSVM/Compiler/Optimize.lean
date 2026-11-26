@@ -7,10 +7,13 @@
   4. Address-offset folding (`v = base + k; load/store [v + off]` -> `load/store [base + (k + off)]`)
   5. Direct `r10` stack folding (`v = r10 + sOff; load/store [v + off]` -> `loadStack/storeStack/storeStackImm`)
   6. Compare-and-branch fusion & operand flipping (`1 <= r` -> `r >= 1`)
-  7. Local CSE (deduplicates repeated pure ALU/address computations within blocks)
-  8. Dead Code & Dead Block-Parameter Elimination (DCE)
-  9. Tail Merging (deduplicates identical error-exit blocks -> slashes `.so` binary size!)
-  10. Unreachable block & forwarding-trampoline pruning
+  7. Unsigned interval range analysis (`VRange = [lo, hi]`): safe `add32`/`sub32`/`mul32` -> `alu64`
+     promotion, redundant low-bit mask elimination (`x & (2^k - 1)` -> `x`), and range-proven branch folding
+  8. Small constant-length `sol_memset_` inline expansion (`<= 5` stores, `<= 40 B`)
+  9. Local CSE (deduplicates repeated pure ALU/address computations within blocks)
+  10. Dead Code & Dead Block-Parameter Elimination (DCE) + Interprocedural Dead Helper Elimination
+  11. Tail Merging (deduplicates identical error-exit blocks -> slashes `.so` binary size!)
+  12. Unreachable block & forwarding-trampoline pruning + `O(log N)` binary-search switch dispatch
 -/
 import LeanSVM.Compiler.IR
 import LeanSVM.SBPF.Peephole
@@ -18,6 +21,181 @@ import Std.Data.HashMap
 import Std.Data.HashSet
 
 namespace LeanSVM.Compiler
+
+/-! ### Sound Unsigned 64-Bit Interval Range Lattice (`VRange`) -/
+
+/-- Sound unsigned 64-bit interval `[lo, hi]` representing all `v : UInt64` with
+    `lo ≤ v.toNat ≤ hi`. Unconstrained values use `VRange.top = [0, 2^64 - 1]`. -/
+structure VRange where
+  lo : Nat
+  hi : Nat
+  deriving Repr, BEq, Inhabited
+
+namespace VRange
+
+def u64Max : Nat := 0xFFFFFFFFFFFFFFFF
+def u32Max : Nat := 0xFFFFFFFF
+def s64Max : Nat := 0x7FFFFFFFFFFFFFFF
+
+def top  : VRange := ⟨0, u64Max⟩
+def u8   : VRange := ⟨0, 0xFF⟩
+def u16  : VRange := ⟨0, 0xFFFF⟩
+def u32  : VRange := ⟨0, u32Max⟩
+def bool : VRange := ⟨0, 1⟩
+
+def exact (v : UInt64) : VRange := ⟨v.toNat, v.toNat⟩
+
+def contains (r : VRange) (v : UInt64) : Prop :=
+  r.lo ≤ v.toNat ∧ v.toNat ≤ r.hi
+
+def join (a b : VRange) : VRange :=
+  ⟨min a.lo b.lo, max a.hi b.hi⟩
+
+def forMemSize : SBPF.MemSize → VRange
+  | .b1 => u8
+  | .b2 => u16
+  | .b4 => u32
+  | .b8 => top
+
+/-- Sound abstract transfer function for IR binary operations. -/
+def evalBinOp (op : BinOp) (ra rb : VRange) : VRange :=
+  match op with
+  | .add64 =>
+    if ra.hi + rb.hi ≤ u64Max then ⟨ra.lo + rb.lo, ra.hi + rb.hi⟩ else top
+  | .sub64 =>
+    if rb.hi ≤ ra.lo then ⟨ra.lo - rb.hi, ra.hi - rb.lo⟩ else top
+  | .mul64 =>
+    if ra.hi * rb.hi ≤ u64Max then ⟨ra.lo * rb.lo, ra.hi * rb.hi⟩ else top
+  | .div64 =>
+    if rb.lo > 0 then ⟨ra.lo / rb.hi, ra.hi / rb.lo⟩ else ⟨0, ra.hi⟩
+  | .mod64 =>
+    if rb.hi > 0 then ⟨0, min ra.hi (rb.hi - 1)⟩ else ⟨0, 0⟩
+  | .and64 =>
+    ⟨0, min ra.hi rb.hi⟩
+  | .or64 | .xor64 =>
+    if ra.hi ≤ 0xFF && rb.hi ≤ 0xFF then u8
+    else if ra.hi ≤ 0xFFFF && rb.hi ≤ 0xFFFF then u16
+    else if ra.hi ≤ u32Max && rb.hi ≤ u32Max then u32
+    else top
+  | .rsh64 =>
+    if rb.hi < 64 then ⟨ra.lo >>> rb.hi, ra.hi >>> rb.lo⟩ else ⟨0, ra.hi⟩
+  | .lsh64 =>
+    if rb.hi < 64 && ra.hi * (2 ^ rb.hi) ≤ u64Max then
+      ⟨ra.lo * (2 ^ rb.lo), ra.hi * (2 ^ rb.hi)⟩
+    else top
+  | .arsh64 => top
+  | .add32 =>
+    if ra.hi + rb.hi ≤ u32Max then ⟨ra.lo + rb.lo, ra.hi + rb.hi⟩ else u32
+  | .sub32 =>
+    if ra.hi ≤ u32Max && rb.hi ≤ ra.lo then ⟨ra.lo - rb.hi, ra.hi - rb.lo⟩ else u32
+  | .mul32 =>
+    if ra.hi * rb.hi ≤ u32Max then ⟨ra.lo * rb.lo, ra.hi * rb.hi⟩ else u32
+  | .and32 =>
+    ⟨0, min (min ra.hi rb.hi) u32Max⟩
+  | .div32 | .mod32 | .or32 | .xor32 | .lsh32 | .rsh32 => u32
+
+/-- Sound abstract transfer function for IR immediate binary operations. -/
+def evalBinImm (op : BinOp) (ra : VRange) (imm : Int32) : VRange :=
+  let rb := exact (if op.is32 then (Int32.toUInt32 imm).toUInt64
+                   else Int64.toUInt64 (Int64.ofInt imm.toInt))
+  evalBinOp op ra rb
+
+/-- Returns `some true` / `some false` when intervals `ra`, `rb` statically decide `op`. -/
+def evalCmp? (op : CmpOp) (ra rb : VRange) : Option Bool :=
+  match op with
+  | .eq =>
+    if ra.hi < rb.lo || rb.hi < ra.lo then some false
+    else if ra.lo == ra.hi && rb.lo == rb.hi && ra.lo == rb.lo then some true
+    else none
+  | .ne =>
+    if ra.hi < rb.lo || rb.hi < ra.lo then some true
+    else if ra.lo == ra.hi && rb.lo == rb.hi && ra.lo == rb.lo then some false
+    else none
+  | .ult =>
+    if ra.hi < rb.lo then some true
+    else if rb.hi ≤ ra.lo then some false
+    else none
+  | .ule =>
+    if ra.hi ≤ rb.lo then some true
+    else if rb.hi < ra.lo then some false
+    else none
+  | .ugt =>
+    if rb.hi < ra.lo then some true
+    else if ra.hi ≤ rb.lo then some false
+    else none
+  | .uge =>
+    if rb.hi ≤ ra.lo then some true
+    else if ra.hi < rb.lo then some false
+    else none
+  | .slt =>
+    if ra.hi ≤ s64Max && rb.hi ≤ s64Max then
+      if ra.hi < rb.lo then some true
+      else if rb.hi ≤ ra.lo then some false
+      else none
+    else none
+  | .sle =>
+    if ra.hi ≤ s64Max && rb.hi ≤ s64Max then
+      if ra.hi ≤ rb.lo then some true
+      else if rb.hi < ra.lo then some false
+      else none
+    else none
+  | .sgt =>
+    if ra.hi ≤ s64Max && rb.hi ≤ s64Max then
+      if rb.hi < ra.lo then some true
+      else if ra.hi ≤ rb.lo then some false
+      else none
+    else none
+  | .sge =>
+    if ra.hi ≤ s64Max && rb.hi ≤ s64Max then
+      if rb.hi ≤ ra.lo then some true
+      else if ra.hi < rb.lo then some false
+      else none
+    else none
+
+/-- True iff `m = 2^k - 1` for some `k ∈ [1..64]` (`0x1`, `0xFF`, `0xFFFF`, `0xFFFFFFFF`, ...). -/
+def isLowBitMask (m : UInt64) : Bool :=
+  m != 0 && (m &&& (m + 1)) == 0
+
+/-- Safely promote a sign-extending sBPF `ALU32` op (`add32`/`sub32`/`mul32`) to its
+    exact 64-bit equivalent whenever operand ranges guarantee zero 32-bit wraparound.
+    Eliminates the trailing `mov32 rd, rd` fixup AND unlocks 64-bit constant/address folding! -/
+def canPromoteAlu32 (op : BinOp) (ra rb : VRange) : Option BinOp :=
+  match op with
+  | .add32 => if ra.hi + rb.hi ≤ u32Max then some .add64 else none
+  | .sub32 => if ra.hi ≤ u32Max && rb.hi ≤ ra.lo then some .sub64 else none
+  | .mul32 => if ra.hi * rb.hi ≤ u32Max then some .mul64 else none
+  | _ => none
+
+end VRange
+
+/-! ### Small Constant-Length `sol_memset_` Inline Expansion (`<= 5` stores) -/
+
+/-- Plan a sequence of `<= maxStores` immediate stores (`(MemSize, offset, imm32)`) that
+    writes `byte` to every byte in `[base, base + len)`, or `none` if `len` exceeds the budget.
+    Uses 8-byte `storeImm .b8` (`0` or `-1`) for `0x00`/`0xFF` (up to 40 bytes in 5 stores)
+    and 4-byte `storeImm .b4` for arbitrary constant bytes (up to 20 bytes in 5 stores). -/
+def planMemsetStores (byte : UInt8) (len : Nat) (maxStores : Nat := 5) :
+    Option (List (SBPF.MemSize × Int16 × Int32)) :=
+  if len > 40 then none
+  else
+    let rec go (rem off : Nat) (fuel : Nat) : Option (List (SBPF.MemSize × Int16 × Int32)) :=
+      if rem == 0 then some []
+      else match fuel with
+        | 0 => none
+        | fuel' + 1 =>
+          let bNat := byte.toNat
+          if rem >= 8 && (byte == 0 || byte == 0xFF) then
+            let imm : Int32 := if byte == 0 then 0 else -1
+            (go (rem - 8) (off + 8) fuel').map ((.b8, Int16.ofInt off, imm) :: ·)
+          else if rem >= 4 then
+            let w32 : UInt32 := (bNat + bNat * 256 + bNat * 65536 + bNat * 16777216).toUInt32
+            (go (rem - 4) (off + 4) fuel').map ((.b4, Int16.ofInt off, UInt32.toInt32 w32) :: ·)
+          else if rem >= 2 then
+            let w16 : Int := (bNat + bNat * 256 : Nat)
+            (go (rem - 2) (off + 2) fuel').map ((.b2, Int16.ofInt off, Int32.ofInt w16) :: ·)
+          else
+            (go (rem - 1) (off + 1) fuel').map ((.b1, Int16.ofInt off, Int32.ofInt bNat) :: ·)
+    go len 0 maxStores
 
 def log2IfPow2 (v : UInt64) : Option Nat :=
   if v == 0 || (v &&& (v - 1)) != 0 then none
@@ -80,21 +258,24 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
   let mut addOffs   : Std.HashMap VReg (VReg × Int) := {} -- v = base + offset
   let mut stackOffs : Std.HashMap VReg Int := {}          -- v = r10 + offset
   let mut cmpDefs   : Std.HashMap VReg (CmpOp × VReg × VReg) := {}
+  let mut ranges    : Std.HashMap VReg VRange := {}
   let mut changed   := false
 
-  -- Pre-scan `constImm` and propagate constant block parameters across incoming edges
-  let mut incomingArgs : Std.HashMap BlockId (Array (Array VReg)) := {}
-  let addIncoming (m : Std.HashMap BlockId (Array (Array VReg))) (tgt : BlockId) (args : Array VReg) :=
-    if args.isEmpty then m else m.insert tgt ((m.getD tgt #[]).push args)
-  for blk in f.blocks do
+  -- Pre-scan `constImm` and record incoming edges (with predecessor index in `f.blocks`)
+  let mut incomingArgs : Std.HashMap BlockId (Array (Nat × Array VReg)) := {}
+  let addIncoming (m : Std.HashMap BlockId (Array (Nat × Array VReg)))
+      (predIdx : Nat) (tgt : BlockId) (args : Array VReg) :=
+    if args.isEmpty then m else m.insert tgt ((m.getD tgt #[]).push (predIdx, args))
+  for bi in [0:f.blocks.size] do
+    let blk := f.blocks[bi]!
     for s in blk.stmts do
       match s with
       | .constImm d v => consts := consts.insert d v
       | _ => pure ()
     match blk.term with
-    | .jmp t a => incomingArgs := addIncoming incomingArgs t a
+    | .jmp t a => incomingArgs := addIncoming incomingArgs bi t a
     | .br _ t ta e ea | .brCmp _ _ _ t ta e ea | .brCmpImm _ _ _ t ta e ea =>
-      incomingArgs := addIncoming (addIncoming incomingArgs t ta) e ea
+      incomingArgs := addIncoming (addIncoming incomingArgs bi t ta) bi e ea
     | _ => pure ()
 
   for blk in f.blocks do
@@ -107,7 +288,7 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
             let mut allSameC := true
             let mut commonV? : Option VReg := none
             let mut allSameV := true
-            for edge in edges do
+            for (_, edge) in edges do
               if k < edge.size then
                 let arg := edge[k]!
                 -- Constant propagation across incoming edges (ignoring self-loops `arg == p`)
@@ -134,7 +315,32 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
 
   let mut newBlocks : Array Block := Array.emptyWithCapacity f.blocks.size
 
-  for blk in f.blocks do
+  for bi in [0:f.blocks.size] do
+    let blk := f.blocks[bi]!
+    -- Sound acyclic merge for block-parameter ranges: ONLY refine when EVERY incoming edge
+    -- originates from a strictly earlier block (`predIdx < bi`), keeping loop headers safely at `top`.
+    if blk.id != 0 && !blk.params.isEmpty then
+      if let some edges := incomingArgs.get? blk.id then
+        if !edges.isEmpty && edges.all (fun e => e.1 < bi) then
+          for k in [0:blk.params.size] do
+            let p := blk.params[k]!
+            let mut joined? : Option VRange := none
+            let mut ok := true
+            for (_, edge) in edges do
+              if k < edge.size then
+                let arg := resolveAlias aliases edge[k]!
+                let rArg := match consts.get? arg with
+                  | some c => VRange.exact c
+                  | none => ranges.getD arg VRange.top
+                joined? := match joined? with
+                  | none => some rArg
+                  | some prev => some (VRange.join prev rArg)
+              else
+                ok := false
+            if ok then
+              if let some jr := joined? then
+                ranges := ranges.insert p jr
+
     let mut outStmts : Array Stmt := Array.emptyWithCapacity blk.stmts.size
     -- Local CSE table within the current basic block: `(opTag, lhs, rhsOrImm) -> vreg`
     let mut localBinImmCse : Std.HashMap (Nat × VReg × Int) VReg := {}
@@ -145,24 +351,43 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
       let s0 := substStmt aliases rawStmt
       if s0 != rawStmt then changed := true
 
+      let getRange (v : VReg) : VRange :=
+        match consts.get? v with
+        | some c => VRange.exact c
+        | none => ranges.getD v VRange.top
+
       let mut s1 : Stmt := s0
+      let mut keepStmt : Bool := true
       match s0 with
       | .constImm d v =>
         consts := consts.insert d v
+        ranges := ranges.insert d (VRange.exact v)
       | .stackAddr d sOff =>
         stackOffs := stackOffs.insert d sOff.toInt
       | .mov d src =>
         if d != src then
           aliases := aliases.insert d src
           if let some c := consts.get? src then consts := consts.insert d c
+          if let some r := ranges.get? src then ranges := ranges.insert d r
           if let some ao := addOffs.get? src then addOffs := addOffs.insert d ao
           if let some so := stackOffs.get? src then stackOffs := stackOffs.insert d so
-      | .binOp op d l r =>
+      | .binOp op0 d l r =>
+        let rl := getRange l
+        let rr := getRange r
+        let (op, promoted) :=
+          match VRange.canPromoteAlu32 op0 rl rr with
+          | some op64 => (op64, true)
+          | none => (op0, false)
+        if promoted then
+          changed := true
+          s1 := .binOp op d l r
+        ranges := ranges.insert d (VRange.evalBinOp op rl rr)
         match consts.get? l, consts.get? r with
         | some cl, some cr =>
           if let some cv := op.evalConst cl cr then
             changed := true
             consts := consts.insert d cv
+            ranges := ranges.insert d (VRange.exact cv)
             s1 := .constImm d cv
         | _, some cr =>
           match op with
@@ -198,12 +423,15 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
             if cr == 0 then
               changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else if let some i32 := fitsInt32U64 cr then
-              changed := true
-              addOffs := addOffs.insert d (l, -i32.toInt)
-              s1 := .binImm .sub64 d l i32
+              -- Normalize `sub64 d, l, imm` to `add64 d, l, (-imm)` when `-imm` fits in Int32:
+              -- identical on both sBPF v0 and v3 (where SUB64_IMM computes `imm - dst`!) and unlocks CSE/folding.
+              if let some negI32 := fitsInt32Int (-i32.toInt) then
+                changed := true
+                addOffs := addOffs.insert d (l, negI32.toInt)
+                s1 := .binImm .add64 d l negI32
           | .mul64 =>
             if cr == 0 then
-              changed := true; consts := consts.insert d 0; s1 := .constImm d 0
+              changed := true; consts := consts.insert d 0; ranges := ranges.insert d (VRange.exact 0); s1 := .constImm d 0
             else if cr == 1 then
               changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else
@@ -223,7 +451,7 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
                   changed := true; s1 := .binImm .div64 d l (Int32.ofInt cr.toNat)
           | .mod64 =>
             if cr == 1 then
-              changed := true; consts := consts.insert d 0; s1 := .constImm d 0
+              changed := true; consts := consts.insert d 0; ranges := ranges.insert d (VRange.exact 0); s1 := .constImm d 0
             else
               match log2IfPow2 cr with
               | some _ =>
@@ -239,12 +467,28 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
             if cr == 0 then changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else if let some i32 := fitsInt32U64 cr then changed := true; s1 := .binImm .xor64 d l i32
           | .and64 =>
-            if cr == 0 then changed := true; consts := consts.insert d 0; s1 := .constImm d 0
-            else if cr == 0xFFFFFFFFFFFFFFFF then changed := true; aliases := aliases.insert d l; s1 := .mov d l
+            if cr == 0 then changed := true; consts := consts.insert d 0; ranges := ranges.insert d (VRange.exact 0); s1 := .constImm d 0
+            else if cr == 0xFFFFFFFFFFFFFFFF || (VRange.isLowBitMask cr && rl.hi <= cr.toNat) then
+              changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else if let some i32 := fitsInt32U64 cr then changed := true; s1 := .binImm .and64 d l i32
+          | .and32 =>
+            let cr32 : UInt64 := cr.toUInt32.toUInt64
+            if cr32 == 0 then changed := true; consts := consts.insert d 0; ranges := ranges.insert d (VRange.exact 0); s1 := .constImm d 0
+            else if VRange.isLowBitMask cr32 && rl.hi <= cr32.toNat then
+              changed := true; aliases := aliases.insert d l; s1 := .mov d l
+            else if let some i32 := fitsInt32U64 cr then changed := true; s1 := .binImm .and32 d l i32
           | .lsh64 | .rsh64 | .arsh64 =>
             if (cr &&& 63) == 0 then changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else changed := true; s1 := .binImm op d l (Int32.ofInt (cr &&& 63).toNat)
+          | .lsh32 | .rsh32 =>
+            -- Mask 32-bit shift immediates into `[0, 31]` (Agave verifier rejects shift imm >= 32!).
+            let sh := (cr.toUInt32 &&& 31).toNat
+            changed := true
+            s1 := .binImm op d l (Int32.ofInt sh)
+          | .sub32 =>
+            if let some i32 := fitsInt32U64 cr then
+              if let some negI32 := fitsInt32Int (-i32.toInt) then
+                changed := true; s1 := .binImm .add32 d l negI32
           | .div32 | .mod32 =>
             if cr > 0 && cr <= 0x7FFFFFFF then
               changed := true; s1 := .binImm op d l (Int32.ofInt cr.toNat)
@@ -255,20 +499,60 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
             changed := true
             s1 := .binOp op d r l
         | none, none =>
-          if op == .sub64 && l == r then
-            changed := true; consts := consts.insert d 0; s1 := .constImm d 0
-          else if op == .xor64 && l == r then
-            changed := true; consts := consts.insert d 0; s1 := .constImm d 0
-      | .binImm op d l imm =>
+          if (op == .sub64 || op == .xor64 || op == .sub32 || op == .xor32) && l == r then
+            changed := true; consts := consts.insert d 0; ranges := ranges.insert d (VRange.exact 0); s1 := .constImm d 0
+      | .binImm op0 d l imm0 =>
+        let rl := getRange l
+        let imm := op0.maskShiftImm imm0
+        if imm != imm0 then
+          changed := true
+          s1 := .binImm op0 d l imm
+        -- Normalize `sub64`/`sub32` immediate to `add64`/`add32` with negated immediate (v0 & v3 safe)
+        let (op1, imm1) :=
+          if op0 == .sub64 then
+            match fitsInt32Int (-imm.toInt) with
+            | some negI => (.add64, negI)
+            | none => (op0, imm)
+          else if op0 == .sub32 then
+            match fitsInt32Int (-imm.toInt) with
+            | some negI => (.add32, negI)
+            | none => (op0, imm)
+          else (op0, imm)
+        if op1 != op0 || imm1 != imm then
+          changed := true
+          s1 := .binImm op1 d l imm1
+        -- Safe `ALU32` immediate promotion requires `imm1.toInt >= 0` so `signExt32 imm1 == zeroExt32 imm1`!
+        let (op, promoted) :=
+          if imm1.toInt >= 0 then
+            let rb := VRange.exact (Int32.toUInt32 imm1).toUInt64
+            match VRange.canPromoteAlu32 op1 rl rb with
+            | some op64 => (op64, true)
+            | none => (op1, false)
+          else (op1, false)
+        let imm := imm1
+        if promoted then
+          changed := true
+          s1 := .binImm op d l imm
+        ranges := ranges.insert d (VRange.evalBinImm op rl imm)
         match consts.get? l with
         | some cl =>
-          let cr : UInt64 := Int64.toUInt64 (Int64.ofInt imm.toInt)
+          let cr : UInt64 := if op.is32 then (Int32.toUInt32 imm).toUInt64
+                             else Int64.toUInt64 (Int64.ofInt imm.toInt)
           if let some cv := op.evalConst cl cr then
             changed := true
             consts := consts.insert d cv
+            ranges := ranges.insert d (VRange.exact cv)
             s1 := .constImm d cv
         | none =>
-          if op == .add64 then
+          if op == .and64 then
+            let mask : UInt64 := Int64.toUInt64 (Int64.ofInt imm.toInt)
+            if VRange.isLowBitMask mask && rl.hi <= mask.toNat then
+              changed := true; aliases := aliases.insert d l; s1 := .mov d l
+          else if op == .and32 then
+            let mask : UInt64 := (Int32.toUInt32 imm).toUInt64
+            if VRange.isLowBitMask mask && rl.hi <= mask.toNat then
+              changed := true; aliases := aliases.insert d l; s1 := .mov d l
+          else if op == .add64 then
             if imm == 0 then
               changed := true; aliases := aliases.insert d l; s1 := .mov d l
             else if let some so := stackOffs.get? l then
@@ -304,15 +588,26 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
                 localBinImmCse := localBinImmCse.insert key d2
             | _ => pure ()
       | .cmp op d l r =>
+        ranges := ranges.insert d VRange.bool
         match consts.get? l, consts.get? r with
         | some cl, some cr =>
           let cv : UInt64 := if op.evalU64 cl cr then 1 else 0
           changed := true
           consts := consts.insert d cv
+          ranges := ranges.insert d (VRange.exact cv)
           s1 := .constImm d cv
         | _, _ =>
-          cmpDefs := cmpDefs.insert d (op, l, r)
+          match VRange.evalCmp? op (getRange l) (getRange r) with
+          | some b =>
+            let cv : UInt64 := if b then 1 else 0
+            changed := true
+            consts := consts.insert d cv
+            ranges := ranges.insert d (VRange.exact cv)
+            s1 := .constImm d cv
+          | none =>
+            cmpDefs := cmpDefs.insert d (op, l, r)
       | .load sz d base off =>
+        ranges := ranges.insert d (VRange.forMemSize sz)
         if let some so := stackOffs.get? base then
           if let some combined := fitsInt16 (so + off.toInt) then
             changed := true
@@ -343,6 +638,7 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
             localStackLoads := localStackLoads.insert key ld
         | _ => pure ()
       | .loadStack sz d off =>
+        ranges := ranges.insert d (VRange.forMemSize sz)
         let key := (off.toInt, memSizeTag sz)
         match localStackLoads.get? key with
         | some prev =>
@@ -408,13 +704,45 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
       | .storeStackImm _ _ _ =>
         localLoads := {}
         localStackLoads := {}
+      | .syscall none sym args =>
+        localLoads := {}
+        localStackLoads := {}
+        -- Inline small constant-length `sol_memset_(dst, val, len)` (`<= 5` immediate stores, `<= 40 B`)
+        if sym == "sol_memset_" && args.size == 3 then
+          let dst := args[0]!
+          match consts.get? args[1]!, consts.get? args[2]! with
+          | some cv, some clen =>
+            if clen == 0 then
+              changed := true
+              keepStmt := false
+            else if let some stores := planMemsetStores cv.toUInt8 clen.toNat 5 then
+              changed := true
+              keepStmt := false
+              for (msz, moff, mimm) in stores do
+                let stStmt : Stmt :=
+                  if let some so := stackOffs.get? dst then
+                    match fitsInt16 (so + moff.toInt) with
+                    | some combined => .storeStackImm msz combined mimm
+                    | none => .storeImm msz dst moff mimm
+                  else if let some (base0, k) := addOffs.get? dst then
+                    match fitsInt16 (k + moff.toInt) with
+                    | some combined => .storeImm msz base0 combined mimm
+                    | none => .storeImm msz dst moff mimm
+                  else .storeImm msz dst moff mimm
+                outStmts := outStmts.push stStmt
+          | _, _ => pure ()
       | .call _ _ _ | .syscall _ _ _ =>
         localLoads := {}
         localStackLoads := {}
       | _ => pure ()
-      outStmts := outStmts.push s1
+      if keepStmt then
+        outStmts := outStmts.push s1
 
-    -- Optimize terminator: alias substitution + compare-branch fusion + operand flip + const fold
+    -- Optimize terminator: alias substitution + compare-branch fusion + range/const fold
+    let getRangeT (v : VReg) : VRange :=
+      match consts.get? v with
+      | some c => VRange.exact c
+      | none => ranges.getD v VRange.top
     let t0 := substTerm aliases blk.term
     if t0 != blk.term then changed := true
     let mut t1 : Term := t0
@@ -445,24 +773,35 @@ private def forwardOptPass (f : Func) : Func × Bool := Id.run do
       | some cl, some cr =>
         changed := true
         t1 := if op.evalU64 cl cr then .jmp tBlk tArgs else .jmp eBlk eArgs
-      | _, some cr =>
-        if let some i32 := fitsInt32U64 cr then
+      | _, _ =>
+        match VRange.evalCmp? op (getRangeT l) (getRangeT r) with
+        | some b =>
           changed := true
-          t1 := .brCmpImm op l i32 tBlk tArgs eBlk eArgs
-      | some cl, none =>
-        if let some i32 := fitsInt32U64 cl then
-          changed := true
-          t1 := .brCmpImm op.flip r i32 tBlk tArgs eBlk eArgs
-      | _, _ => pure ()
+          t1 := if b then .jmp tBlk tArgs else .jmp eBlk eArgs
+        | none =>
+          match consts.get? l, consts.get? r with
+          | _, some cr =>
+            if let some i32 := fitsInt32U64 cr then
+              changed := true
+              t1 := .brCmpImm op l i32 tBlk tArgs eBlk eArgs
+          | some cl, none =>
+            if let some i32 := fitsInt32U64 cl then
+              changed := true
+              t1 := .brCmpImm op.flip r i32 tBlk tArgs eBlk eArgs
+          | _, _ => pure ()
     | .brCmpImm op l imm tBlk tArgs eBlk eArgs =>
+      let cr : UInt64 := Int64.toUInt64 (Int64.ofInt imm.toInt)
       match consts.get? l with
       | some cl =>
-        let cr : UInt64 := Int64.toUInt64 (Int64.ofInt imm.toInt)
         changed := true
         t1 := if op.evalU64 cl cr then .jmp tBlk tArgs else .jmp eBlk eArgs
       | none =>
         let mut fused := false
-        if (op == .eq || op == .ne) && imm == 0 then
+        if let some b := VRange.evalCmp? op (getRangeT l) (VRange.exact cr) then
+          changed := true
+          fused := true
+          t1 := if b then .jmp tBlk tArgs else .jmp eBlk eArgs
+        if !fused && (op == .eq || op == .ne) && imm == 0 then
           if let some (cOp, a, b) := cmpDefs.get? l then
             let a' := resolveAlias aliases a
             let b' := resolveAlias aliases b
@@ -796,5 +1135,38 @@ def optimizeFunc (f : Func) : Func := Id.run do
     let (fClean, _) := cfgCleanupPass fSw
     return fClean
   return cur
+
+/-! ### Interprocedural Dead Helper Elimination (`removeDeadHelpers`) -/
+
+/-- All helper labels directly called by `Stmt.call` inside `f`. -/
+def Func.calledLabels (f : Func) : List String :=
+  f.blocks.toList.flatMap fun blk =>
+    blk.stmts.toList.filterMap fun s =>
+      match s with
+      | .call _ lbl _ => some lbl
+      | _ => none
+
+/-- Deduplicated append of `xs` into `acc`. -/
+def addUniqueLabels (acc : List String) (xs : List String) : List String :=
+  xs.foldl (fun a lbl => if a.contains lbl then a else lbl :: a) acc
+
+/-- Fixed-point call-graph reachability over `helpers` starting from `reached`:
+    each step adds every `calledLabels` of every helper whose `labelPrefix ∈ reached`,
+    deduplicated and terminating early at fixed point (`next.length == reached.length`). -/
+def expandReachableLabels (helpers : List Func) : Nat → List String → List String
+  | 0, reached => reached
+  | fuel + 1, reached =>
+    let next := helpers.foldl (fun acc h =>
+      if acc.contains h.labelPrefix then addUniqueLabels acc h.calledLabels else acc) reached
+    if next.length == reached.length then reached
+    else expandReachableLabels helpers fuel next
+
+/-- Interprocedural Dead Helper Elimination: removes any outlined helper in `prog.helpers`
+    not reachable from `prog.entry` via `Stmt.call` chains (preserving deterministic order). -/
+def removeDeadHelpers (prog : Program) : Program :=
+  let helpersList := prog.helpers.toList
+  let init := addUniqueLabels [] prog.entry.calledLabels
+  let reached := expandReachableLabels helpersList helpersList.length init
+  { prog with helpers := prog.helpers.filter (fun h => reached.contains h.labelPrefix) }
 
 end LeanSVM.Compiler

@@ -11,5 +11,6 @@ import LeanSVM.Compiler.Lower
 import LeanSVM.Compiler.Optimize
 import LeanSVM.Compiler.RegAlloc
 import LeanSVM.Compiler.CodeGen
+import LeanSVM.Compiler.Validate
 import LeanSVM.Compiler.Proofs
 import LeanSVM.Compiler.Driver

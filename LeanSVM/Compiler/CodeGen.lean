@@ -165,9 +165,12 @@ def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter : Nat) (
       (o2.push (.neg64 Reg.r0) |>.push (.stx .b8 Reg.r10 Reg.r0 off), cmpCounter)
     | .imm _ => (out, cmpCounter)
   | .binImm op dst lhs imm =>
+    let imm' := op.maskShiftImm imm
     let emitAlu (d : Reg) (acc : Array Insn) : Array Insn :=
-      if op.is32 then acc.push (.alu32Imm op.toAluOp d imm)
-      else acc.push (.alu64Imm op.toAluOp d imm)
+      if op.is32 then
+        let acc1 := acc.push (.alu32Imm op.toAluOp d imm')
+        if op.toAluOp.signExtendsInAlu32 then acc1.push (.alu32Reg .mov d d) else acc1
+      else acc.push (.alu64Imm op.toAluOp d imm')
     match getLoc alloc dst with
     | .reg dr =>
       let (lr, o1) := loadVReg alloc lhs dr out
@@ -186,7 +189,9 @@ def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter : Nat) (
     let (lr, o1) := loadVReg alloc lhs lhsScratch out
     let (rr, o2) := loadVReg alloc rhs Reg.r5 o1
     let emitAlu (d s : Reg) (acc : Array Insn) : Array Insn :=
-      if op.is32 then acc.push (.alu32Reg op.toAluOp d s)
+      if op.is32 then
+        let acc1 := acc.push (.alu32Reg op.toAluOp d s)
+        if op.toAluOp.signExtendsInAlu32 then acc1.push (.alu32Reg .mov d d) else acc1
       else acc.push (.alu64Reg op.toAluOp d s)
     match getLoc alloc dst with
     | .reg dr =>
@@ -302,9 +307,8 @@ def emitStmt (f : Func) (alloc : AllocResult) (stmt : Stmt) (cmpCounter : Nat) (
       | none => o2
     (o3, cmpCounter)
 
-/-- Generate optimized sBPF machine instructions for a single SSA `Func`. -/
-def generateFuncCode (f : Func) : Array Insn × AllocResult := Id.run do
-  let alloc := allocateRegisters f
+/-- Generate sBPF machine instructions for a single SSA `Func` given a pre-computed `AllocResult`. -/
+def generateFuncCodeWithAlloc (f : Func) (alloc : AllocResult) : Array Insn := Id.run do
   let blocks := alloc.orderedBlocks
   let mut blkMap : Std.HashMap BlockId Block := {}
   for b in blocks do blkMap := blkMap.insert b.id b
@@ -429,7 +433,12 @@ def generateFuncCode (f : Func) : Array Insn × AllocResult := Id.run do
         if nextBlkId? != some eBlk then
           out := out.push (.ja (blkLabel f eBlk))
 
-  return (out, alloc)
+  return out
+
+/-- Generate optimized sBPF machine instructions for a single SSA `Func`. -/
+def generateFuncCode (f : Func) : Array Insn × AllocResult :=
+  let alloc := allocateRegisters f
+  (generateFuncCodeWithAlloc f alloc, alloc)
 
 /-- Backwards-compatible single-function wrapper. -/
 def generateCode (f : Func) : Array Insn × AllocResult :=
