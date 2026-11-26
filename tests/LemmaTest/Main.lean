@@ -4,13 +4,17 @@
 -/
 import LemmaTest.Harness
 import LemmaTest.NatTests
+import LemmaTest.MathTests
+import LemmaTest.VectorTests
 
 open Lean LemmaTest
 
 def main : IO UInt32 := do
-  let env ← loadEnv #[`LemmaTest.NatProbes]
+  let env ← loadEnv #[`LemmaTest.NatProbes, `LemmaTest.MathProbes]
   let ((), report) ← (do
       NatTests.suite env
+      MathTests.suite env
+      VectorTests.suite env
     : TestM Unit).run {}
   IO.println s!"\n{report.passed} checks passed, {report.failed.size} failed"
   for f in report.failed[:min 40 report.failed.size] do IO.println s!"  FAIL {f}"

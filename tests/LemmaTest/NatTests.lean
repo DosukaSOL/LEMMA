@@ -96,5 +96,12 @@ def suite (env : Environment) : TestM Unit := do
     check ((e.splitOn "does not fit in 64 bits").length > 1) fun _ =>
       s!"p_bigLiteral: rejected for the wrong reason: {e}"
     IO.println "   p_bigLiteral: rejected at compile time ✓"
+  section_ "LEMMA patch 0002: constructor payloads are never silently dropped"
+  match compile env `LemmaTest.Patch0002.p_optionJoin with
+  | .ok _ => check false fun _ => "p_optionJoin compiled, but the Option payload would be lost"
+  | .error e =>
+    check ((e.splitOn "LEMMA patch 0002").length > 1) fun _ =>
+      s!"p_optionJoin: rejected for the wrong reason: {e}"
+    IO.println "   p_optionJoin: rejected at compile time ✓"
 
 end LemmaTest.NatTests

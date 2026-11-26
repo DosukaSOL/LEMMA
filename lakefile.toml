@@ -27,3 +27,14 @@ supportInterpreter = true
 
 [[lean_lib]]
 name = "Lemma"
+
+[[lean_exe]]
+name = "lemma-audit"
+srcDir = "tests"
+root = "LemmaAudit.Main"
+supportInterpreter = true
+
+[[lean_exe]]
+name = "lemma-vectors"
+srcDir = "tests"
+root = "LemmaVectors.Main"

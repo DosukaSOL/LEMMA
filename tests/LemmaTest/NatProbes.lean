@@ -5,6 +5,7 @@
   `c : u64 @16`. Each probe succeeds (returns 0) iff its `Nat` expression equals `c.toNat`.
 -/
 import LeanSVM
+import Lemma.Math.MulDiv
 
 open LeanSVM
 
@@ -71,3 +72,22 @@ def p_bigLiteral (input : Ptr) : SolanaM Unit := do
   SolanaM.require (a * a > 2 ^ 64) Err.invalidArgument
 
 end LemmaTest.NatProbes
+
+namespace LemmaTest.Patch0002
+
+/-- An `Option` with a runtime payload flowing through an `if` join point: the value of one of
+    two multi-branch `Option` functions is selected by `mode`. Upstream lean-svm compiled this
+    and silently replaced the payload with 0 (observed: 6,978 wrong results in the `mulDiv`
+    differential suite). LEMMA patch 0002 MUST reject it at compile time. -/
+def p_optionJoin (input : Ptr) : SolanaM Unit := do
+  let a ← loadU64 input 0
+  let b ← loadU64 input 8
+  let d ← loadU64 input 16
+  let mode ← loadU8 input 24
+  let c ← loadU64 input 32
+  let r := if mode == 0 then Lemma.Math.mulDivFloor a b d else Lemma.Math.mulDivCeil a b d
+  match r with
+  | none => SolanaM.fail 7
+  | some q => SolanaM.require (q == c) Err.invalidArgument
+
+end LemmaTest.Patch0002
