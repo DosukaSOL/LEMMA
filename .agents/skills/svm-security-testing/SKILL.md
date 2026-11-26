@@ -226,42 +226,51 @@ In multi-account / cross-margin protocols, allowing withdrawals, risk-increasing
 
 ---
 
-### 11. Real-World Solana Mainnet Threat Model: `K = 4` Adversarial Leader Windows & Compounding Bounds
+### 11. Real-World Solana Mainnet Threat Model: `K + 1 = 5` Leader Censorship & Post-Jump `liqFee` Compounding
 
 **The Bug:**
-- Assuming a 1-slot rate limit or 1-slot delay stops an adversarial validator. On Solana mainnet, a single leader is scheduled for **`K = 4` consecutive slots** (~1.6s), and a colluding cartel / Jito bundle builder can censor competing liquidations or bids across `T` consecutive slots.
-- Using a linear `4 * maxMoveBps` approximation for 4 consecutive price steps understates true compounding `((10_000 + m)^4 - 10_000^4) / 10_000^3` (e.g. `m = 100` bps gives `406.04` bps, NOT `400` bps — breaching `mmBps = 500` when `liqFeeBps = 100`!).
+- Assuming a 1-slot rate limit or 1-slot delay stops an adversarial validator. On Solana mainnet, a single leader is scheduled for **`K = 4` consecutive slots** (~1.6s). Moreover, a position that is healthy at slot `t` (`equity ≥ mm`) can cross below `mm` on **triggering slot `t + 1`** and then suffer **`K = 4` consecutive censored slots** (`t + 2 .. t + 5`), meaning **5 compounded oracle moves** (`p0 → p5`) can elapse before an honest leader liquidates at `p5`!
+- Using a linear `4 * maxMoveBps` or even `K = 4` approximation understates both true 5-step compounding `((10_000 + m)^5 - 10_000^5) / 10_000^4` AND the fact that `liqFee` is charged on **post-jump notional `q * p5`** (up to `p5 / p0 ≤ 1 + k5MoveBps / 10_000` larger for Shorts!), not `q * p0`.
 - Leaving `imBps - mmBps < maxMoveBps` allows a same-slot oracle update to push a freshly opened position straight past maintenance margin.
 
 **How to Prevent:**
-- Model the exact `K = 4` (or `T`-slot) adversarial-leader censorship window explicitly in your Lean `ThreatModel`.
-- Enforce the exact compounded envelope at market/pool creation:
-  - `k4MoveBps := 4 * maxMoveBps + (maxMoveBps * maxMoveBps + 999) / 1000` (proven `≥` exact 4-step compounding for all `m ≤ 2500`)
-  - `k4MoveBps + liqFeeBps ≤ mmBps` AND `mmBps + maxMoveBps ≤ imBps`
+- Model the exact `K + 1 = 5` triggering + censored window AND post-jump `liqFee` at `p5` explicitly in your Lean `ThreatModel`.
+- Enforce the exact compounded `K + 1 = 5` envelope at market/pool creation (for `maxMoveBps ≤ 1500`):
+  - `k5MoveBps := 5 * maxMoveBps + (12 * maxMoveBps * maxMoveBps + 9999) / 10_000` (proven `≥` exact 5-step compounding!)
+  - `liqAtP5 := liqFeeBps + (liqFeeBps * k5MoveBps + 9999) / 10_000` (exact upper bound on `liqFee` at `p5`!)
+  - `k5MoveBps + liqAtP5 ≤ mmBps` AND `mmBps + maxMoveBps ≤ imBps`
 - Never rely on `T = 1`-slot delays for liveness or auction clearing; any anti-censorship window (e.g. batch auction epoch or wind-down staleness) must satisfy `windowSlots ≫ K = 4` (e.g. `≥ 32` slots minimum, `750–2250` slots / 5–15 min in production).
 
 **LiteSVM Test Recipe:**
-- Test exact boundary rejection (`m = 100, mm = 500, liqFee = 100` → rejected; `m = 95` → accepted).
-- Simulate 4 consecutive adversarial oracle steps with liquidations censored until slot 5, and assert `badDebt == 0` and `insDraw == 0`.
+- Test exact boundary rejection (`m = 80, mm = 500, liqFee = 100` → `k5(80)+liqAtP5 = 513 > 500` rejected; `m = 75` → accepted).
+- Simulate `K + 1 = 5` consecutive adversarial oracle steps with liquidations censored until the honest slot, and assert `badDebt == 0` and `insDraw == 0`.
 
 ---
 
-### 12. Permissionless Multi-Market Isolation & Stale-Oracle DoS
+### 12. Permissionless Multi-Market Non-Contagion Firewall & Stale-Oracle DoS
 
 **The Bug:**
+- **Dual-Direction Cross-Market Contagion (`M_atk → I_BTC`):** If a permissionless cross-margin portfolio holds ALL collateral in a single shared `capital` pool with no per-leg firewall, an attacker can open an honest `BTC` leg (`mm = $50`) alongside a self-controlled permissionless `M_atk` leg in the SAME portfolio, pump `M_atk` (or trigger `M_atk` `liqFee` debits) to drain shared `capital → 0` right before `BTC` ticks down `-0.75%`, and then liquidate their own `BTC` leg with **`$0` backing** — stealing directly from honest `I_BTC` (and breaking the single-market `K + 1 = 5` solvency precondition `equity ≥ mm`)!
 - **Stale-oracle cross-margin DoS:** In a multi-market cross-margin portfolio, if `RefreshLeg` requires `checkOracleFresh`, any permissionless or abandoned market can halt its oracle to permanently freeze `Withdraw` and `Liquidate` on *every* user holding a leg in that market (even on healthy BTC/ETH legs!).
-- **Capital-shielding / partial-bankruptcy drain:** Reserving capital per-leg (`reservedMm`) so a loser triggers insurance draws while still holding `capital > 0`, OR allowing partial liquidation on a `capital == 0` bankrupt leg (leaving zombie bad debt).
+- **Capital-shielding / partial-bankruptcy drain (Bug 1B / 1C):** Leaving `freeCapital > 0` or `leg[m].lockedMm > 0` when drawing `I_m`, OR allowing partial liquidation when `freeCapital == 0 && leg[m].lockedMm == 0` (leaving zombie bad debt).
 - **Asymmetric post-ADL rounding & sub-nanounit dust:** After partial ADL (`oiSide < rawSide`), using floored `Δk` on the losing side under-collects relative to winners (`∑ gain > ∑ loss`), and a `>10^9:1` wipeout can leave `oi > 0` with `adl == 0` (an unclosable zombie leg).
 - **Fronting / receivable NAV arbitrage:** When an insurance pool fronts USD to winners (`insFronted > 0`), pricing LP share mints on cash `ins` alone lets attackers mint cheap shares and capture incoming loser repayments.
 
 **How to Prevent:**
-- **Rule of thumb:** An unrelated adversarial permissionless market must **never** touch an honest user's PnL/capital, **never** touch another market's insurance/reward buckets, and **never** freeze another market's liveness.
-- Do **not** call `checkOracleFresh` in `RefreshLeg` (a stale market has frozen `markPrice`, settles `ΔK = 0`, keeps its full `cachedMm`/`cachedIm` locked, and unblocks same-slot freshness on healthy legs).
-- Settle losses against **full portfolio capital** (`shortfall > 0 ⇒ capital' == 0`), force full close when `capital == 0`, use ceiling `Δk` on the losing side vs floor `Δk` on the winning side, snap sub-nanounit dust OI (`adl' == 0`) cleanly to `0`, and price insurance LP mints on optimistic NAV (`ins + insFronted`) while bounding `maxFrontBps ≤ maxInsDrawBps`.
+- **Per-Leg `lockedMm` Firewall + Shared `freeCapital`:** Split portfolio equity into `freeCapital` (`PflOff.capital`) + per-leg `leg[i].lockedMm` (with cached sum `PflOff.totalLockedMm == ∑ leg[i].lockedMm`, `DexOff.totalCapital == ∑_P (P.freeCapital + P.totalLockedMm)`):
+  - **Loss & `liqFee` isolation:** Losses and liquidation fees on market `m` burn strictly `leg[m].posPnl → freeCapital → leg[m].lockedMm`, and are **FORBIDDEN** from touching `leg[j].lockedMm` for any `j ≠ m`.
+  - **Zero-sum immediate release:** When a leg shrinks or closes, `syncLegMargins` releases excess `lockedMm` immediately back to `freeCapital`; when a leg grows or mark price rises, `syncLegMargins` tops up `lockedMm` from `freeCapital`.
+  - **Per-leg liquidation health & Bug 1B/1C:** Market `m` health is `freeCapital + leg[m].lockedMm + posPnl ≥ leg[m].cachedMm`; insurance draw requires `shortfall > 0 && freeCapital == 0 && leg[m].lockedMm == 0`; full close is forced whenever `freeCapital == 0 && leg[m].lockedMm == 0`.
+  - **Permissionless cross-margin preserved:** Realized gains on any market credit `freeCapital` and immediately back other markets; excess collateral above `∑ leg[i].lockedMm` freely offsets cross-market losses!
+- **Stale-oracle non-blocking:** Do **not** call `checkOracleFresh` in `RefreshLeg` (a stale market has frozen `markPrice`, settles `ΔK = 0`, keeps its full `cachedMm`/`cachedIm`/`lockedMm`, and unblocks same-slot freshness on healthy legs).
+- **Post-ADL & Fronting:** Use ceiling `Δk` on the losing side vs floor `Δk` on the winning side, snap sub-nanounit dust OI (`adl' == 0`) cleanly to `0`, and price insurance LP mints on optimistic NAV (`ins + insFronted`) while bounding `maxFrontBps ≤ maxInsDrawBps`.
+
+**Formal Proof Pattern (Multi-Market Inductive Non-Contagion):**
+- Prove an inductive trace theorem over arbitrary `List AdvMarketOp` executed on adversarial markets `m_atk ≠ m_real` showing `leg[m_real].lockedMm` is **bit-for-bit invariant**, AND couple it with a `SvmState.mem` bytecode refinement proving `settleAndRefreshLeg` on `slotIdx` never mutates `legPtrAt fData j + LegOff.lockedMm` for any `j ≠ slotIdx`!
 
 **LiteSVM Test Recipe:**
-- Create an adversarial permissionless market, halt its oracle past `maxStaleness`, and verify a user with legs in both the stale market and a healthy market can still refresh, withdraw excess margin, and be liquidated cleanly.
-- Verify an adversarial market's trades, liquidations, and reward claims leave every unrelated market's `insurance`, `realizedPool`, `rewardAccrued` and every unrelated user's `capital` bit-for-bit untouched.
+- Reproduce the exact `M_atk → I_BTC` contagion exploit: open Long `$1,000` honest BTC (`mm=$50`) + Short `$1,000` permissionless `M_atk` (`mm=$50`) in one portfolio; pump `M_atk +25%`, refresh + liquidate `M_atk` (draining `freeCapital → 0` and `M_atk.lockedMm → 0`, including `liqFee`); assert `BTC.lockedMm == $50` bit-for-bit intact; tick BTC down `-0.75%` and liquidate BTC; assert `shortfall == 0` and `I_BTC` draw == `0`!
+- Halt a permissionless market's oracle past `maxStaleness` and verify a user with legs in both the stale market and a healthy market can still refresh, withdraw excess margin, and be liquidated cleanly.
 
 ---
 
@@ -310,28 +319,40 @@ In multi-account / cross-margin protocols, allowing withdrawals, risk-increasing
 
 **How to Prevent:**
 - Always add a compile-time `by decide` theorem in your `Layout` module proving `lastField + fieldWidth ≤ size ∧ size % 8 == 0` for every account struct — making off-by-N layout truncation impossible at compile time.
+- **Spec↔Program Non-Drift Rule:** Never leave single-market or idealized assumptions in `Spec.lean` / `ThreatModel.lean` that are violated by multi-market or cross-instruction interactions in `Program.lean`. Every precondition of an economic theorem (e.g., `equity ≥ mm` before a `K+1`-slot window, or `virtBids ∈ [1, MAX_VIRT_BIDS]`) must be **inductively preserved across ALL instructions** (including adversarial markets, liquidation fees, and hand-off modes) and coupled directly to `Refinement.lean` on `SvmState.mem`.
+- **Manual `nextCursor` `ABI.nonDupMarker` Rule:** Whenever parsing accounts manually via `nextCursor` (instead of a helper that already checks `0xFF`), ALWAYS verify `(← rawLoadU8 acc) == ABI.nonDupMarker` — or, where legitimate self-aliasing is supported (e.g., rotating `oracleAuth` back to `marketAdmin` via `[mkt, admin, admin]`), explicitly resolve `dupIdx == 1` to the original `AccountView` before reading its pubkey!
 - Follow **Proof-Driven Development (PDD)**: whenever auditing a new feature or closing a bug, first state the adversarial threat model + prove the exact failure/extraction bound, fix the implementation, prove the `SvmState.mem` bytecode refinement, and execute the exact adversarial exploit in LiteSVM against the compiled `.so` ELF.
 - Whenever modifying `lean-svm` lowering/regalloc/peephole passes, immediately run ALL verified example ELFs + downstream LiteSVM adversarial & fuzz suites.
 
 ---
 
-### 16. Adversarial External PropAMM / Matcher CPI-Out Containment (0 Signer Delegation)
+### 16. Adversarial External PropAMM / Matcher CPI-Out & HLP Vault Containment (0 Signer Delegation)
 
 **The Bug:**
 - **CPI-In signer delegation:** Having a taker call an untrusted third-party matcher which CPIs into core with `takerOwner (S)` delegates the taker's top-level signer authority to closed-source code (enabling SOL/SPL drains or spoofed trades).
+- **Unwhitelisted Permissionless Market Drain (`M_scam` via `matcher.so`):** If a passive PropAMM quotes ANY `marketId` forwarded by a taker without checking an immutable `allowedMarkets` allowlist, an anonymous attacker can create a permissionless `M_scam` with an attacker-controlled oracle, open a large trade against an LP/HLP portfolio via `TradeWithMatcher`, pump `M_scam`, and drain 100% of the LP/HLP vault's `freeCapital`!
+- **HLP Strategist Rug (`SetHlpMatcher` / `HlpTakeoverLiquidate`):** Even if an HLP vault forbids strategist withdrawals, a rogue strategist who can bind an arbitrary `evil_matcher.so` context (or a PropAMM quoting `M_scam`, or `HlpTakeoverLiquidate` on `M_scam`) can still drain 100% of LP deposits through bad fills or scam-market takeovers!
 - **`noop.so` / stale-buffer quote replay:** Reading a quote struct written by an external matcher without a monotonic nonce lets a no-op program replay a stale quote forever.
-- **Unbounded fill / abusive pricing / self-CPI / re-entrancy:** Passing core state accounts or skipping core-side `fillQty ≤ maxQty`, `limitPrice`, `maxMoveBps`, or `matcherProg != progId` checks lets a malicious matcher over-fill, manipulate price, or re-enter core.
+- **Unbounded fill / abusive pricing / self-CPI / re-entrancy / fee-bypass hand-off:** Passing core state accounts or skipping core-side `fillQty ≤ maxQty`, `limitPrice`, `maxMoveBps`, or `matcherProg != progId` checks lets a malicious matcher over-fill, manipulate price, or re-enter core. Omitting `tradeFeeBps` on `mode = 2/3` hand-offs lets traders evade trading fees whenever transferring positions to a new counterparty.
 
 **How to Prevent:**
 - Use **0-signer CPI-Out** from core to `matcherProg`: verify `takerOwner (S)` in core ONLY, NEVER pass `takerOwner` or core writable accounts to `matcherProg` — pass strictly `[matcherCtx (W, S=0)]` (+ optional readonly non-signer `extraAcc`, ALWAYS requiring `rawLoadU8 extraAcc == ABI.nonDupMarker` so passing a core/signer account as `extraAcc` can never cause an 8-byte dup-stub memory overread!).
+- **Immutable PropAMM Market Allowlist:** Pin `allowedCount ∈ [1..8]` + `allowedMarkets[8]` in `PropCtx` at `InitPropAmm` (immutable — `UpdatePropAmm` can never modify it) and reject any unlisted `marketId` on every batch leg (`MErr.marketNotAllowed`).
+- **Immutable HLP Vault Strategist Constraints:** Pin `allowedMatcherProg` + `allowedMarkets[8]` on `HlpVault` at `InitHlpVault`. Enforce in `SetHlpMatcher` that `mc.owner == allowedMatcherProg ∧ magic == MAGIC_MRET ∧ mc.allowedMarkets ⊆ HlpVault.allowedMarkets`, and enforce in `HlpTakeoverLiquidate` that `mkt.marketId ∈ HlpVault.allowedMarkets`.
 - Bind `lpPfl.matcherCtx` on the LP's portfolio so the LP retains 100% EOA custody (can revoke or withdraw directly at any time) and require `matcherCtx.owner == matcherProg`, `isExecutable matcherProg`, and `matcherProg != progId`.
 - Pass `reqSeq = preSeq + 1` in the CPI request (wrapping `UInt64` add satisfies `preSeq + 1 ≠ preSeq` unconditionally!) and require `magic == MAGIC_MRET ∧ status == 0 ∧ seq == reqSeq` post-CPI.
-- Support unified multi-market batching (`k ∈ [1..8]` distinct markets with `dupMarker == 0xFF` & distinct `marketId` checks) in ONE CPI so market makers see all offers atomically without tx introspection, while core enforces `0 < fillQty_i ≤ maxQty_i`, taker `limitPrice_i`, `maxMoveBps`, and atomic rollback across all `k` legs.
+- Support unified multi-market batching (`k ∈ [1..8]` distinct markets with `dupMarker == 0xFF` & distinct `marketId` checks) in ONE CPI so market makers see all offers atomically without tx introspection, while core enforces `0 < fillQty_i ≤ maxQty_i`, taker `limitPrice_i`, `maxMoveBps`, `tradeFeeBps` on `mode = 0/2/3`, and atomic rollback across all `k` legs.
 - **Universal economic buy/sell spread direction across open & reduce:** Never key spread/limit direction on raw `takerIsLong` when closing (`mode = 1`): closing an existing Long is a **SELL** (receives Bid `≤ markP`, floored by `≥ limitPrice`), and closing an existing Short is a **BUY** (pays Ask `≥ markP`, capped by `≤ limitPrice`). Compute `takerIsBuying = (mode == 0 && takerIsLong) || (mode == 1 && !takerIsLong)` in both core limit checks and matchers, and swap `applyExecSpread` arguments on `mode = 1` so third-party PropAMMs using standard Bid/Ask quotes never invert spread payments on reduces.
-- **Ceiling virtual reserves & auto-closed receipts:** In virtual-reserve batch auctions (`xy = k`), compute `virtBids = mulDiv64Ceil totalPot resRate POS_SCALE` (never floor!) so `virtBids ≥ 1` holds unconditionally even on tiny pots (`totalPot * resRate < 1e6`), discharging the quiet-epoch price-cap precondition (`B_virt > 0`). In one-shot claim handlers (`ClaimQuote`), auto-close the per-bid receipt (`zeroWords` + `MAGIC_CLOSED` + refund lamports to `bidder (W, S)` with `bidReceipt != bidder` aliasing check) to prevent permanent per-bid rent leaks with zero extra opcodes.
+- **Overflow-free ceiling virtual reserves & auto-closed receipts:** In virtual-reserve batch auctions (`xy = k`), compute `virtBids` via overflow-free capping (`computeVirtBidsU64` yielding `virtBids ∈ [1, MAX_VIRT_BIDS]`, never overflowing `UInt64` when `resRate == MAX_RATE_E6` and `totalPot` is large, and never rounding to `0` on tiny pots!). In one-shot claim handlers (`ClaimQuote`), auto-close the per-bid receipt (`zeroWords` + `MAGIC_CLOSED` + refund lamports to `bidder (W, S)` with `bidReceipt != bidder` aliasing check) to prevent permanent per-bid rent leaks with zero extra opcodes.
 
 **LiteSVM Test Recipe:**
-- Compile a real adversarial `evil_matcher.so` attacking all vectors (over-fill, abusive `limitPrice`, nonzero `status`, stale `seq` / `noop.so`, bad magic, zero fill, exceeding `maxMoveBps`, writing readonly `extraAcc`, aliased duplicate market in batch, self-CPI) and verify every attack reverts cleanly while multi-market correlated baskets succeed atomically (and LP earns spread on BOTH opens and reduces).
+- Compile a real adversarial `evil_matcher.so` attacking all vectors (over-fill, abusive `limitPrice`, nonzero `status`, stale `seq` / `noop.so`, bad magic, zero fill, exceeding `maxMoveBps`, writing readonly `extraAcc`, aliased duplicate market in batch, self-CPI) AND verify:
+  - Anonymous `TradeWithMatcher` on an unlisted `M_scam` → rejected (`Custom(201)`).
+  - HLP strategist binding `evil_matcher.so` ctx → rejected (`Custom(507)`).
+  - HLP strategist binding honest PropAMM ctx whose allowlist includes `M_scam` → rejected (`Custom(508)`).
+  - HLP strategist calling `HlpTakeoverLiquidate` on unlisted `M_scam` → rejected (`Custom(508)`).
+  - `mode = 2/3` hand-offs charge exact `tradeFeeBps` on the incoming opening buyer.
+  - `UpdateMarketAuth` self-rotation `[mkt, admin, admin]` cleanly resolves dup index `1` without corrupting keys.
 - Verify small-pot `virtBids == 1` (`totalPot * resRate < 1e6`) blocks 100% drain by a 1-atom bidder, and verify `ClaimQuote` refunds 100% of receipt rent lamports to `bidder` while blocking double-claim / same-tx revival.
 
 ---
