@@ -1,0 +1,25 @@
+diff --git a/LeanSVM/Compiler/Lower.lean b/LeanSVM/Compiler/Lower.lean
+index 0ea5365..36fff7e 100644
+--- a/LeanSVM/Compiler/Lower.lean
++++ b/LeanSVM/Compiler/Lower.lean
+@@ -219,9 +219,18 @@ private def valToReg (v : Val) : LowerM VReg := do
+   | .ctorVal 0 #[a, .erased] => valToReg a
+   | .ctorVal tag #[a] =>
+     -- Single-field wrapper (e.g. `UInt64.mk`, `BitVec.ofFin`, `Fin.mk`)
+-    if tag == 0 then valToReg a else emitConst tag.toUInt64
++    if tag == 0 then valToReg a
++    else
++      -- LEMMA patch 0002: upstream returned only the tag here, silently discarding the
++      -- payload (e.g. `Option.some q` became `1`, and `q` was later read back as 0).
++      match a with
++      | .erased => emitConst tag.toUInt64
++      | _ => throw s!"constructor (tag {tag}) with a runtime payload cannot be passed through a single-register slot (e.g. an `Option`/sum value flowing through an `if` join point or a multi-branch return); restructure the code (LEMMA patch 0002)"
+   | .structVal #[a] => valToReg a
+-  | .dynCtor tag _ => return tag
++  | .dynCtor tag payloads =>
++    -- LEMMA patch 0002: same silent payload loss for dynamically-tagged constructors.
++    if payloads.isEmpty then return tag
++    else throw s!"dynamically-tagged constructor with {payloads.size} runtime payload(s) cannot be passed through a single-register slot (LEMMA patch 0002)"
+   | other => throw s!"expected scalar value for register, got: {repr other}"
+ 
+ /-- Extract compile-time constant `Nat` if available (for `stackAlloc`, widths, etc.). -/
