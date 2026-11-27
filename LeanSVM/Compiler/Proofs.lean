@@ -4487,38 +4487,31 @@ theorem removeDeadHelpers_sound (prog : Program) :
 
 /-! ## 14. sBPF v3 Opcode Soundness, Div/Mod Trap Safety & Certified Translation Validation -/
 
-/-- All distinct sBPF opcode encodings emitted by `ISA.assemble` for a given `Version`. -/
-def allEmittedOpcodes (ver : Version) : List UInt8 :=
+/-- All distinct sBPF v3 opcode encodings emitted by `ISA.assemble` (SIMD-0178 + SIMD-0189 + SIMD-0377),
+    with static syscalls (`0x85 src=0`) and internal calls (`0x85 src=1`) sharing `CALL_IMM (0x85)`. -/
+def allEmittedOpcodes : List UInt8 :=
   let aluOps : List AluOp := [.add, .sub, .mul, .div, .or, .and, .lsh, .rsh, .mod, .xor, .mov, .arsh]
   let memSizes : List MemSize := [.b1, .b2, .b4, .b8]
-  -- On v3, `alu64Imm .sub` / `alu32Imm .sub` are lowered to `add` (never emitted directly);
-  -- `0x17` (`SUB64_IMM dst, 0`) is reserved exclusively for `neg64Opc .v3`!
-  let alu64ImmOps := match ver with | .v0 => aluOps | .v3 => aluOps.filter (· != AluOp.sub)
-  let alu32ImmOps := match ver with | .v0 => aluOps | .v3 => aluOps.filter (· != AluOp.sub)
-  (aluOps.map (alu64RegOpc ver)) ++
-  (alu64ImmOps.map (alu64ImmOpc ver)) ++
-  (aluOps.map (alu32RegOpc ver)) ++
-  (alu32ImmOps.map (alu32ImmOpc ver)) ++
-  (memSizes.map (ldxOpc ver)) ++
-  (memSizes.map (stxOpc ver)) ++
-  (memSizes.map (stImmOpc ver)) ++
-  [neg64Opc ver, 0x05, 0x85] ++
-  (match ver with | .v0 => [0x18, 0x95] | .v3 => [0xf7, 0x95, 0x9d])
+  (aluOps.map alu64RegOpc) ++
+  (aluOps.map alu64ImmOpc) ++
+  (aluOps.map alu32RegOpc) ++
+  (aluOps.map alu32ImmOpc) ++
+  (memSizes.map ldxOpc) ++
+  (memSizes.map stxOpc) ++
+  (memSizes.map stImmOpc) ++
+  [neg64Opc, 0x05, 0x85, 0x18, 0x95]
 
-/-- **THEOREM (sBPF v0 & v3 Opcode Disjointness — Zero Collisions)**:
-    Every single instruction opcode emitted by production `ISA.assemble` is pairwise distinct
-    for BOTH sBPF v0 AND sBPF v3 (making collisions like v3 `0x87 = ST_4B_IMM` vs removed
-    `0x87 = NEG64` mathematically impossible!). -/
+/-- **THEOREM (sBPF v3 Opcode Disjointness — Zero Collisions)**:
+    Every single instruction opcode emitted by production `ISA.assemble` is pairwise distinct! -/
 theorem sbpf_opcodes_disjoint :
-    listNoDup (allEmittedOpcodes .v0) = true ∧
-    listNoDup (allEmittedOpcodes .v3) = true := by
+    listNoDup allEmittedOpcodes = true := by
   decide
 
-/-- **THEOREM (sBPF v3 `neg64` = `SUB64_IMM dst, 0` Soundness)**:
-    Under sBPF v2/v3 (SIMD-0174), `SUB64_IMM dst, 0` (`0x17`) computes `0 - dst`, which is
-    bit-for-bit identical to two's-complement negation `evalNeg64 dst`! -/
-theorem neg64_v3_subImm_sound (a : UInt64) :
-    (0 : UInt64) - a = (0 - a) ∧ neg64Opc .v3 = 0x17 ∧ neg64Opc .v3 ≠ stImmOpc .v3 .b4 := by
+/-- **THEOREM (Shipping sBPF v3 `neg64` = `NEG64 (0x87)` Disjoint from `ST_4B_IMM`)**:
+    Under shipping sBPF v3 (SIMD-0377), `neg64Opc = 0x87` (`NEG64`) and is distinct from every
+    memory store opcode (`stImmOpc`). -/
+theorem neg64_v3_sound (a : UInt64) :
+    (0 : UInt64) - a = (0 - a) ∧ neg64Opc = 0x87 ∧ neg64Opc ≠ stImmOpc .b4 := by
   refine ⟨rfl, rfl, by decide⟩
 
 /-- **THEOREM (`subImm` → `addImm (-imm)` Soundness — sBPF v0 & v3 Exact Equivalence)**:

@@ -20,14 +20,12 @@ namespace LeanSVM.Compiler
 open Lean
 
 structure CompileOptions where
-  sbpfVersion : SBPF.Version := .v0
   dumpIR      : Bool := false
   dumpAsm     : Bool := false
   deriving Repr
 
 structure CompileResult where
   entryName   : String
-  sbpfVersion : SBPF.Version
   elfBytes    : ByteArray
   insns       : Array SBPF.Insn
   insnCount   : Nat
@@ -82,12 +80,11 @@ def compileEntrypoint (env : Environment) (entryName : Name) (opts : CompileOpti
   let helperCount := optProg.helpers.size
   let asmDump := if opts.dumpAsm then SBPF.formatProgram insns else ""
 
-  -- Stage 4: Direct Native ELF64 `.so` Linking & Serialization
-  let (elfBytes, assembled) ← SBPF.emitElf insns prog.rodata opts.sbpfVersion
+  -- Stage 4: Direct Native sBPF v3 ELF64 `.so` Linking & Serialization (SIMD-0178 + SIMD-0189 + SIMD-0377)
+  let (elfBytes, assembled) ← SBPF.emitElf insns prog.rodata
 
   return {
     entryName   := entryName.toString
-    sbpfVersion := opts.sbpfVersion
     elfBytes    := elfBytes
     insns       := insns
     insnCount   := assembled.insnCount
@@ -104,8 +101,7 @@ def compileEntrypoint (env : Environment) (entryName : Name) (opts : CompileOpti
   }
 
 def CompileResult.formatStats (r : CompileResult) : String :=
-  let verStr := match r.sbpfVersion with | .v0 => "sBPF v0" | .v3 => "sBPF v3"
-  s!"[lean-svm] Compiled {r.entryName} ({verStr})\n" ++
+  s!"[lean-svm] Compiled {r.entryName} (sBPF v3)\n" ++
   s!"  instructions : {r.insnCount} (helpers: {r.helperCount})\n" ++
   s!"  .text size   : {r.textBytes} bytes\n" ++
   s!"  .rodata size : {r.rodataBytes} bytes\n" ++

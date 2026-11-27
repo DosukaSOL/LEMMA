@@ -16,12 +16,38 @@ const SPL_TOKEN_ID: Address = address!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ
 const SPL_TOKEN_2022_ID: Address = address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
 
+/// Enforce strict shipping sBPF v3 ELF64 header invariants (SIMD-0178 + SIMD-0189 + SIMD-0377 + SIMD-0500):
+/// `e_machine == EM_BPF (247)`, `e_entry == 0x100000000`, `e_flags == 3 (SBPFVersion::V3)`,
+/// `e_phnum ∈ 1..=2`, and every PHDR is `PT_LOAD (1)` (zero `PT_DYNAMIC`, zero relocations).
+fn assert_sbpf_v3_elf(name: &str, elf: &[u8]) {
+    assert!(elf.len() >= 64, "{name}: ELF truncated (< 64 bytes)");
+    assert_eq!(&elf[0..4], b"\x7fELF", "{name}: bad ELF magic");
+    assert_eq!(elf[4], 2, "{name}: must be ELFCLASS64");
+    assert_eq!(elf[5], 1, "{name}: must be ELFDATA2LSB");
+    assert_eq!(u16::from_le_bytes(elf[16..18].try_into().unwrap()), 3, "{name}: must be ET_DYN");
+    assert_eq!(u16::from_le_bytes(elf[18..20].try_into().unwrap()), 247, "{name}: must be EM_BPF (247)");
+    assert_eq!(u64::from_le_bytes(elf[24..32].try_into().unwrap()), 0x1_0000_0000, "{name}: e_entry must be MM_BYTECODE_START (0x100000000)");
+    assert_eq!(u64::from_le_bytes(elf[32..40].try_into().unwrap()), 64, "{name}: e_phoff must be 64");
+    assert_eq!(u32::from_le_bytes(elf[48..52].try_into().unwrap()), 3, "{name}: e_flags must be 3 (SBPFVersion::V3 / SIMD-0500)");
+    let phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap()) as usize;
+    assert!((1..=2).contains(&phnum), "{name}: strict sBPF v3 must have 1 or 2 PHDRs, got {phnum}");
+    for i in 0..phnum {
+        let off = 64 + i * 56;
+        let p_type = u32::from_le_bytes(elf[off..off + 4].try_into().unwrap());
+        assert_eq!(p_type, 1, "{name}: PHDR[{i}] must be PT_LOAD (1), got {p_type} (no PT_DYNAMIC allowed)");
+    }
+}
+
 fn load_so(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("build")
         .join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    if !name.starts_with("rust/") {
+        assert_sbpf_v3_elf(name, &bytes);
+    }
+    bytes
 }
 
 fn send_ix(

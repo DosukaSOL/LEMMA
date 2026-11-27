@@ -32,5 +32,5 @@ if [ -x "$SOLANA_TOOLS/rust/bin/rustc" ]; then
   done
 fi
 
-echo "=== 4. Execute all programs & benchmarks on real LiteSVM (Agave 3.1.3) ==="
+echo "=== 4. Execute all sBPF v3 programs & benchmarks on real LiteSVM 0.18 (Agave 4.x) ==="
 cargo run --manifest-path svm-runner/Cargo.toml --release
