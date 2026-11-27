@@ -127,12 +127,59 @@ Predicates (specifications) over the serialized input buffer:
 | `guard_bind_ok` | If a program that starts with a check succeeds, the check's predicate held in the initial state, and the rest of the program ran from that same state. |
 | `guard_bind_err` | If the predicate fails, the whole program fails with the check's code and no state change. |
 
-## 4. Example program: `GuardedCounter` (`Lemma/Examples/GuardedCounter.lean`)
+Additional guard and composition lemmas (`Lemma/Guard.lean`):
+
+| Theorem | Plain English |
+|---|---|
+| `requireDisjoint_guard` | The runtime check `requireDisjoint p q` succeeds **exactly when** the 8-byte fields at `p` and `q` don't overlap (`Mem.Disjoint8 p q`). |
+| `bind_ok_inv`, `require_bind_ok` | Stepping lemmas: a successful sequential program is a successful first step followed by a successful rest. A successful `require c` means `c` was true. |
+| `checkedAdd64_ok`, `checkedSub64_ok` | A successful checked add or subtract returns the exact integer result and doesn't change state. |
+
+## 4. Memory model (`Lemma/Mem.lean`)
+
+Upstream's versions of these facts are proved with `bv_decide` (native code), so LEMMA re-proves
+them with the kernel alone. They are what allows theorems about the state **after** a program writes.
+
+| Theorem | Plain English |
+|---|---|
+| `readU64_writeU64_same` | Reading a 64-bit word right after writing it returns the written value. |
+| `readU64_writeU64_disjoint` | Writing a word doesn't change any word whose 8 bytes don't overlap it (`Disjoint8`, modulo 2^64). |
+| `mem_writeU64_of_ne` | A byte outside a written word is unchanged. |
+| `readU32_toNat`, `readU64_toNat` | A loaded word equals the little-endian sum of its bytes. |
+| `ne_of_disjoint8`, `disjoint8_comm`, `add_eq_add_iff`, `self_eq_add_iff`, `add_eq_self_iff` | Address-arithmetic helpers. |
+
+## 5. Parsing (`Lemma/Parse.lean`)
+
+| Theorem | Plain English |
+|---|---|
+| `nextCursor_state`, `skipAccounts_state` | Walking the account list never changes the VM state. |
+| `parse5_ok` | The 5-account parser doesn't change state, and the first account is at `input + 8`. |
+
+## 6. Component: fee splitter (`Lemma/Components/FeeSplitter*.lean`)
+
+The program splits lamports from a program-owned vault to three recipients fixed in its
+configuration, by basis-point shares. **Rounding:** recipients 1 and 2 get their floor share;
+recipient 0 gets the rest, i.e. its own floor share plus the dust.
+
+| Theorem | Plain English |
+|---|---|
+| `split_dust_bound` | If the shares sum to 10,000 bps, recipient 0's remainder share is between its own floor share and that floor + 2. **The dust is at most 2 lamports**, and the two floor shares never exceed the amount. |
+| `validBps_toNat` | The on-chain share check means the three shares really sum to 10,000; a wrapped `u64` sum can't pass. |
+| `splitIx_spec` | **About the deployed `Split` handler.** Whenever it succeeds: (1) every check held: 5 non-duplicate slots, authority signed, vault and recipients writable, vault owned by the program, vault tagged, signer and recipients equal to the configured keys. (2) Exact accounting: the shares sum **exactly** to `amount`; recipient 1 and 2 get `⌊amount·bps/10000⌋`; recipient 0's share satisfies the dust bound; the vault loses exactly `amount`, which it had; each recipient gains exactly its share; the vault keeps at least its reserve; and **the total lamports of the four accounts are conserved.** |
+| `initIx_spec` | **About the deployed `Init` handler.** Whenever it succeeds: every check held; the vault was **uninitialized** (tag 0) and had the right size; the configured shares sum to 10,000; the reserve was covered; and the vault is now tagged as initialized. |
+| `initIx_rejects_initialized` | **Re-initialization is impossible:** `Init` never succeeds on a vault whose tag is already set. |
+| `entrypoint_dispatch` | Whenever the deployed entrypoint succeeds, it ran exactly one of the two handlers, from the initial state, with the authority in the first slot. So the two `_spec` theorems cover every successful transaction. |
+
+Non-vacuity: the hypotheses are satisfiable. The test suite runs successful `Init` and `Split`
+transactions on both the compiled binary and the Lean definition, which must agree byte for byte,
+and on LiteSVM.
+
+## 7. Example program: `GuardedCounter` (`Lemma/Examples/GuardedCounter.lean`)
 
 | Theorem | Plain English |
 |---|---|
 | `entrypoint_checks` | **About the deployed entrypoint:** whenever `entrypoint` succeeds, the authority slot (the first account) was a non-duplicate signer, and the counter slot was a non-duplicate, writable account, owned by the program id from the input, with the counter kind tag. |
-| `parse2_ok`, `nextCursor_state`, `skipAccounts_state` | Parsing the account list never changes the VM state, and the first account is at `input + 8`. |
+| `parse2_ok` | Parsing the account list never changes the VM state, and the first account is at `input + 8` (built on `Lemma.Parse`). |
 
 `entrypoint_checks` is backed by 12 attack scenarios that run on **both** the compiled binary and
 the Lean definition and must agree (`tests/LemmaTest/GuardTests.lean`). That includes an honest

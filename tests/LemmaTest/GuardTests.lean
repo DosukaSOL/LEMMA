@@ -29,13 +29,6 @@ def ERR_DUP : UInt64 := 0x4C4D0002
 def ERR_KIND : UInt64 := 0x4C4D0003
 def ERR_NOT_ENOUGH : UInt64 := 0x0000000B00000000
 
-/-- The Lean `SvmState` holding `input` at the VM's input address (all other bytes 0). -/
-def leanState (input : ByteArray) : LeanSVM.SvmState :=
-  { mem := fun a =>
-      if Sbpf.inputStart ≤ a && a < Sbpf.inputStart + input.size.toUInt64 then
-        input.get! (a - Sbpf.inputStart).toNat
-      else 0 }
-
 /-- Run one scenario on BOTH the compiled binary (interpreter) and the Lean definition the
     theorems are about; check the expected outcome and that the two agree. -/
 def scenario (prog : Compiled) (name : String) (slots : List Slot) (want : Sbpf.Halt)

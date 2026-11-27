@@ -14,11 +14,12 @@ guarantee depends on that is **not** itself proven.
 `Lean.ofReduceBool` and no `*._native.*` axioms; `lake exe lemma-audit` fails the build if one
 appears.
 
-Upstream lean-svm is different: **36 of its 621 theorems** depend on `bv_decide`'s native axioms.
-These trust Lean's compiler and the bundled LRAT checker as well as the kernel. Examples are
-`vault_transfer_conserves_lamports`, `mulDiv64_ok_spec` and the core `SvmState` memory lemmas. The
-full list is in the axiom report. **LEMMA's proofs don't use any of them.** LEMMA has its own
-kernel-only `mulDiv` and key comparison for exactly this reason.
+Upstream lean-svm is different: **48 of its 767 theorems** (at `587ab09`) depend on `bv_decide`'s
+native axioms. These trust Lean's compiler and the bundled LRAT checker as well as the kernel.
+Examples are `mulDiv64_ok_spec` and the core memory lemmas `SvmState.readU64_writeU64_same` /
+`_disjoint`. The full list is in the axiom report. **LEMMA's proofs don't use any of them.** LEMMA has
+its own kernel-only `mulDiv`, key comparison and memory lemmas (`Lemma.Mem`) for exactly this
+reason.
 
 ## 2. From Lean definition to running program
 
@@ -26,7 +27,7 @@ kernel-only `mulDiv` and key comparison for exactly this reason.
 |---|---|---|
 | lean-svm compiler (Lean → sBPF), **with LEMMA patches 0001 and 0002** | That the `.so` behaves like the Lean definition | The compiler is **not verified end to end**. Upstream proves 60 lemmas about individual passes. LEMMA adds differential testing: every LEMMA program is compiled and its results compared with the Lean definition, or with an exact `Nat` reference, on thousands of inputs. Testing found two upstream miscompilation bugs (see `patches/`); there may be more. |
 | ELF linker / encoder (`LeanSVM/SBPF/`) | The bytes match the symbolic instructions | Upstream proves `pushRawInsn_roundtrip` (it uses `bv_decide`). LEMMA's interpreter runs the *symbolic* instructions, so it doesn't check encoding. **Only the LiteSVM job in CI executes the real ELF bytes.** |
-| LEMMA's sBPF interpreter (`tests/LemmaTest/Sbpf.lean`) | Test results | Ordinary unverified test code, written independently of the compiler and deliberately strict (garbage in caller-saved registers after syscalls, poisoned uninitialised stack, strict memory regions). It is a test oracle, not Agave. |
+| LEMMA's sBPF interpreter (`tests/LemmaTest/Sbpf.lean`) | Test results | Ordinary unverified test code, written independently of the compiler. Its ALU, call-frame and exit semantics follow Agave's `solana-sbpf` v0.23.0 source (the version LiteSVM 0.18.2 uses), and it is deliberately strict: garbage in caller-saved registers after syscalls, poisoned uninitialised stack, strict memory regions. It is a test oracle, not Agave. |
 
 ## 3. Solana runtime
 
@@ -36,20 +37,21 @@ kernel-only `mulDiv` and key comparison for exactly this reason.
 | `is_signer` / `is_writable` flags are set truthfully by the runtime | `Signer`, `Writable` |
 | The 32 bytes after the instruction data are the **executing program's id** | `OwnedBy … progId` in `GuardedCounter` |
 | Each distinct account appears in exactly one non-duplicate slot; repeats use duplicate markers | Rejecting duplicates via `NonDup` |
-| sBPF v0 semantics (wrapping 64-bit ALU, `mov32` zero-extension, `div`/`mod` by zero aborts, `abort` syscall terminates the instruction) | Patch 0001, and all compiled code |
+| sBPF v3 semantics as implemented by Agave (lean-svm emits v3 only since `587ab09`): wrapping 64-bit ALU; sign-extended `add32`/`sub32`/`mul32`, other 32-bit ops zero-extended; `div`/`mod` by zero aborts; the `abort` syscall terminates the instruction | Patch 0001, and all compiled code |
 | Rent, account ownership transfer, and lamport accounting by the runtime | Not used yet: there are no lamport- or rent-moving LEMMA programs |
 
-## 4. Syscalls and CPIs: modelled as stubs
+## 4. Syscalls and CPIs
 
-lean-svm's `SvmState` model gives syscalls **placeholder** semantics:
-- `sysMemcmp` compares one byte;
-- `sysSha256` doesn't hash;
-- `sysInvokeSignedC` (CPI) always "succeeds" and has no effect on other accounts.
+lean-svm's `SvmState` model has improved since the fork point. As of `587ab09`:
+- `sysMemcmp` compares the full range;
+- `sysSha256` is a byte-exact FIPS 180-4 model;
+- `sysInvokeSignedC` (CPI) takes the **callee's behaviour as a parameter** (`cpiHandler`) and only
+  commits its writes to accounts marked writable.
 
-**Any theorem whose proof goes through a syscall or CPI says nothing about the real syscall.**
-LEMMA's current theorems use none of them; the guards use plain loads. Future components that
-make CPIs (for example token transfers) must treat the CPI target's behaviour as an assumption and
-state it explicitly.
+So any theorem about a program that makes a CPI holds **for every callee behaviour the handler can
+represent**, but says nothing about what the real callee (e.g. the SPL Token program) actually
+does. That behaviour is an assumption and must be stated per program. LEMMA's current programs make
+no syscalls besides `abort` and no CPIs.
 
 ## 5. Not covered at all
 

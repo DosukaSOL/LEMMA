@@ -10,6 +10,7 @@
 -/
 import LeanSVM
 import Lemma.Guard
+import Lemma.Parse
 
 namespace Lemma.Examples.GuardedCounter
 open LeanSVM Lemma.Guard Lemma.Spec
@@ -43,35 +44,7 @@ signer, and the counter slot was a non-duplicate, writable, program-owned accoun
 kind. -/
 
 namespace Proofs
-open LeanSVM Lemma.Guard Lemma.Spec
-
-theorem nextCursor_state (acc : AccountView) (s s' : SvmState) (p : Ptr)
-    (h : AccountView.nextCursor acc s = .ok p s') : s' = s := by
-  unfold AccountView.nextCursor at h
-  simp only [Bind.bind, SolanaM.bind, rawLoadU8] at h
-  split at h <;> cases h <;> rfl
-
-theorem skipAccounts_state : ∀ (n : Nat) (c rem : UInt64) (s s' : SvmState) (p : Ptr),
-    rem.toNat = n → Input.skipAccounts c rem s = .ok p s' → s' = s := by
-  intro n
-  refine Nat.strongRecOn n ?_
-  intro n ih
-  · intro c rem s s' p hn h
-    rw [Input.skipAccounts] at h
-    by_cases h0 : rem = 0
-    · simp only [h0, ↓reduceDIte] at h
-      simp only [Pure.pure, SolanaM.pure] at h; cases h; rfl
-    · simp only [h0, ↓reduceDIte] at h
-      simp only [Bind.bind, SolanaM.bind] at h
-      split at h
-      · rename_i q s1 hq
-        have e1 := nextCursor_state c s s1 q hq
-        have hlt : (rem - 1).toNat < n := by
-          have : rem.toNat ≠ 0 := fun hz => h0 (UInt64.toNat_inj.mp (by rw [hz]; rfl))
-          rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr (by show 1 ≤ _; omega))]
-          show rem.toNat - 1 < n; omega
-        rw [ih _ hlt q (rem - 1) s1 s' p rfl h, e1]
-      · cases h
+open LeanSVM Lemma.Guard Lemma.Spec Lemma.Parse
 
 theorem parse2_ok (input : Ptr) (s s' : SvmState) (r : AccountView × AccountView × LeanSVM.ByteSlice × Ptr)
     (h : Input.parse2 input s = .ok r s') : s' = s ∧ r.1 = input + 8 := by

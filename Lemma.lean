@@ -8,3 +8,7 @@ import Lemma.Math.Witnesses
 import Lemma.Spec.Accounts
 import Lemma.Guard
 import Lemma.Examples.GuardedCounter
+import Lemma.Mem
+import Lemma.Parse
+import Lemma.Components.FeeSplitter
+import Lemma.Components.FeeSplitterProofs

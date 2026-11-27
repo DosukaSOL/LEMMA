@@ -15,3 +15,4 @@ Lemma.Examples.GuardedCounter Lemma.Examples.GuardedCounter.entrypoint  guarded_
 LemmaTest.ChainProbes        LemmaTest.ChainProbes.mulDiv             probe_muldiv
 LemmaTest.ChainProbes        LemmaTest.ChainProbes.swap               probe_swap
 LemmaTest.ChainProbes        LemmaTest.ChainProbes.natAdd             probe_nat_add
+Lemma.Components.FeeSplitter Lemma.Components.FeeSplitter.entrypoint   fee_splitter

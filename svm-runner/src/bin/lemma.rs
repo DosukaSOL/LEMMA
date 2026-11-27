@@ -20,6 +20,7 @@ const ERR_MISMATCH: &str = "Custom(2989)"; // 0xBAD
 const ERR_DIV_ZERO: &str = "Custom(1280114689)"; // 0x4C4D0001
 const ERR_DUPLICATE: &str = "Custom(1280114690)"; // 0x4C4D0002
 const ERR_WRONG_KIND: &str = "Custom(1280114691)"; // 0x4C4D0003
+const ERR_WRONG_RECIPIENT: &str = "Custom(1280114692)"; // 0x4C4D0004
 const COUNTER_TAG: u64 = 0x52544E554F434D4C;
 
 fn repo_path(rel: &str) -> PathBuf {
@@ -225,9 +226,89 @@ fn guarded_counter() {
     assert_eq!(count_of(&ctx, &c), 42, "failed attacks must not change the counter");
 }
 
+/// LEMMA fee splitter on the real SVM: Init, exact splits (incl. rounding dust), attacks, and a
+/// randomized differential against the exact share formula.
+fn fee_splitter() {
+    let so = load_so("fee_splitter.so");
+    let mut ctx = Ctx::new();
+    let program_id = Address::new_unique();
+    ctx.svm.add_program(program_id, &so).unwrap();
+    let auth = Keypair::new();
+    let mallory = Keypair::new();
+    let (r0, r1, r2) = (Address::new_unique(), Address::new_unique(), Address::new_unique());
+    const RCPT: u64 = 1_000_000_000; // rent-exempt recipients (Agave forbids crediting rent-paying ones)
+    for r in [r0, r1, r2] {
+        ctx.svm.set_account(r, Account { lamports: RCPT, ..Default::default() }).unwrap();
+    }
+    const VAULT_LAMPORTS: u64 = 10_000_000_000;
+    const RESERVE: u64 = 3_000_000; // above the rent-exempt minimum for 168 bytes
+    let vault = Address::new_unique();
+    ctx.svm.set_account(vault, Account {
+        lamports: VAULT_LAMPORTS, data: vec![0u8; 168], owner: program_id, ..Default::default()
+    }).unwrap();
+    let lam = |ctx: &Ctx, a: &Address| ctx.svm.get_account(a).unwrap().lamports;
+    let metas = |authk: Address, a: Address, b: Address, c: Address| vec![
+        AccountMeta::new_readonly(authk, true), AccountMeta::new(vault, false),
+        AccountMeta::new(a, false), AccountMeta::new(b, false), AccountMeta::new(c, false)];
+    let init_data = |b0: u64, b1: u64, b2: u64, reserve: u64| {
+        let mut d = vec![0u8];
+        for x in [b0, b1, b2, reserve] { d.extend_from_slice(&x.to_le_bytes()); }
+        d
+    };
+    let split_data = |amount: u64| { let mut d = vec![1u8]; d.extend_from_slice(&amount.to_le_bytes()); d };
+    let expect_err = |r: Result<u64, String>, want: &str, name: &str| match r {
+        Err(e) if e.contains(want) => println!("[PASS] FeeSplitter rejects: {name}"),
+        other => panic!("FeeSplitter / {name}: expected {want}, got {other:?}"),
+    };
+
+    let r = ctx.send(program_id, metas(auth.pubkey(), r0, r1, r2), init_data(3333, 3333, 3333, RESERVE), &[&auth]);
+    expect_err(r, "InvalidInstructionData", "init with shares not summing to 10000");
+    let cu = ctx.send(program_id, metas(auth.pubkey(), r0, r1, r2), init_data(3333, 3333, 3334, RESERVE), &[&auth])
+        .expect("init");
+    println!("[PASS] FeeSplitter init ({cu} CU, {} B .so)", so.len());
+    let r = ctx.send(program_id, metas(mallory.pubkey(), r0, r1, r2), init_data(0, 0, 10000, RESERVE), &[&mallory]);
+    expect_err(r, "AccountAlreadyInitialized", "re-initialization by an attacker");
+
+    let before = [lam(&ctx, &vault), lam(&ctx, &r0), lam(&ctx, &r1), lam(&ctx, &r2)];
+    let cu = ctx.send(program_id, metas(auth.pubkey(), r0, r1, r2), split_data(1001), &[&auth]).expect("split");
+    let after = [lam(&ctx, &vault), lam(&ctx, &r0), lam(&ctx, &r1), lam(&ctx, &r2)];
+    assert_eq!(after, [before[0] - 1001, before[1] + 335, before[2] + 333, before[3] + 333],
+               "split 1001 must give 335 (incl. 2 dust) / 333 / 333");
+    println!("[PASS] FeeSplitter split 1001 -> 335 (incl. 2 dust) / 333 / 333 ({cu} CU)");
+
+    let r = ctx.send(program_id, metas(auth.pubkey(), mallory.pubkey(), r1, r2), split_data(1001), &[&auth]);
+    expect_err(r, ERR_WRONG_RECIPIENT, "attacker substituted as recipient");
+    let r = ctx.send(program_id, metas(mallory.pubkey(), r0, r1, r2), split_data(1001), &[&mallory]);
+    expect_err(r, "IllegalOwner", "signer is not the configured authority");
+    let r = ctx.send(program_id, metas(auth.pubkey(), vault, r1, r2), split_data(1001), &[&auth]);
+    expect_err(r, ERR_DUPLICATE, "vault passed as a recipient (duplicate)");
+    let bal = lam(&ctx, &vault);
+    let r = ctx.send(program_id, metas(auth.pubkey(), r0, r1, r2), split_data(bal - RESERVE + 1), &[&auth]);
+    expect_err(r, "InsufficientFunds", "split that would breach the reserve");
+
+    // randomized differential against the exact formula (deterministic xorshift)
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    let shares = [3333u64, 3333, 3334];
+    for _ in 0..200 {
+        let amount = next() % 5_000_000;
+        let b = [lam(&ctx, &vault), lam(&ctx, &r0), lam(&ctx, &r1), lam(&ctx, &r2)];
+        ctx.send(program_id, metas(auth.pubkey(), r0, r1, r2), split_data(amount), &[&auth])
+            .unwrap_or_else(|e| panic!("random split {amount} failed: {e}"));
+        let s1 = (amount as u128 * shares[1] as u128 / 10000) as u64;
+        let s2 = (amount as u128 * shares[2] as u128 / 10000) as u64;
+        let s0 = amount - s1 - s2;
+        let a = [lam(&ctx, &vault), lam(&ctx, &r0), lam(&ctx, &r1), lam(&ctx, &r2)];
+        assert_eq!(a, [b[0] - amount, b[1] + s0, b[2] + s1, b[3] + s2], "random split {amount}");
+        assert_eq!(a.iter().map(|&v| v as u128).sum::<u128>(), b.iter().map(|&v| v as u128).sum::<u128>());
+    }
+    println!("[PASS] FeeSplitter 200 random splits: exact shares, lamports conserved");
+}
+
 fn main() {
     println!("== LEMMA on LiteSVM ==");
     guarded_counter();
+    fee_splitter();
     nat_abort();
     vectors();
     println!("== ALL LEMMA LITESVM CHECKS PASSED ==");

@@ -4,7 +4,7 @@
 
 Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 
-## LEMMA theorems (56)
+## LEMMA theorems (81)
 
 | Theorem | Axioms |
 |---|---|
@@ -17,19 +17,31 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 | `Lemma.Compiler.NatLowering.mul_exact_of_zero` | `propext` |
 | `Lemma.Compiler.NatLowering.sub_exact` | `Quot.sound`, `propext` |
 | `Lemma.Compiler.NatLowering.trunc32_exact` | `Quot.sound`, `propext` |
+| `Lemma.Components.FeeSplitter.Proofs.entrypoint_dispatch` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Components.FeeSplitter.Proofs.initIx_rejects_initialized` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Components.FeeSplitter.Proofs.initIx_spec` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Components.FeeSplitter.Proofs.splitIx_spec` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Components.FeeSplitter.Proofs.split_dust_bound` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Components.FeeSplitter.Proofs.validBps_toNat` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Examples.GuardedCounter.Proofs.entrypoint_checks` | `Classical.choice`, `Quot.sound`, `propext` |
-| `Lemma.Examples.GuardedCounter.Proofs.nextCursor_state` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Examples.GuardedCounter.Proofs.parse2_ok` | `Classical.choice`, `Quot.sound`, `propext` |
-| `Lemma.Examples.GuardedCounter.Proofs.skipAccounts_state` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.bind_ok_inv` | _(none)_ |
+| `Lemma.Guard.bind_rawLoadU64` | `Quot.sound`, `propext` |
+| `Lemma.Guard.bind_rawLoadU8` | _(none)_ |
+| `Lemma.Guard.bind_rawStoreU64` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.checkedAdd64_ok` | `Quot.sound`, `propext` |
+| `Lemma.Guard.checkedSub64_ok` | `Quot.sound`, `propext` |
 | `Lemma.Guard.guard_bind_err` | `propext` |
 | `Lemma.Guard.guard_bind_ok` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.keyEq_eq` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.requireDisjoint_guard` | `propext` |
 | `Lemma.Guard.requireKey_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireNonDup_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireOwner_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireSigner_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireTag_guard` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Guard.requireWritable_guard` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Guard.require_bind_ok` | `propext` |
 | `Lemma.Math.Witnesses.fpMulM_can_succeed` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Math.Witnesses.mulDivCeilM_can_succeed` | `Classical.choice`, `Quot.sound`, `propext` |
 | `Lemma.Math.Witnesses.mulDivFloorM_can_succeed` | `Classical.choice`, `Quot.sound`, `propext` |
@@ -64,6 +76,19 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 | `Lemma.Math.toNat_shl32` | `propext` |
 | `Lemma.Math.toNat_shr32` | `propext` |
 | `Lemma.Math.window_step` | `Quot.sound`, `propext` |
+| `Lemma.Mem.add_eq_add_iff` | `propext` |
+| `Lemma.Mem.add_eq_self_iff` | `propext` |
+| `Lemma.Mem.disjoint8_comm` | _(none)_ |
+| `Lemma.Mem.mem_writeU64_of_ne` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Mem.ne_of_disjoint8` | `Quot.sound`, `propext` |
+| `Lemma.Mem.readU32_toNat` | `Quot.sound`, `propext` |
+| `Lemma.Mem.readU64_toNat` | `Quot.sound`, `propext` |
+| `Lemma.Mem.readU64_writeU64_disjoint` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Mem.readU64_writeU64_same` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Mem.self_eq_add_iff` | `propext` |
+| `Lemma.Parse.nextCursor_state` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Parse.parse5_ok` | `Classical.choice`, `Quot.sound`, `propext` |
+| `Lemma.Parse.skipAccounts_state` | `Classical.choice`, `Quot.sound`, `propext` |
 
 ## Upstream lean-svm theorems (informational)
 
@@ -118,6 +143,6 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 - `LeanSVM.SvmState.readU64_writeU64_same`
 - `LeanSVM.sysGetClock_spec`
 
-## Runtime `Nat` lint (37 LEMMA runtime definitions)
+## Runtime `Nat` lint (60 LEMMA runtime definitions)
 
 No `Nat` arithmetic is reachable from any LEMMA runtime definition.

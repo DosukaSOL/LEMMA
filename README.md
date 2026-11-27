@@ -49,8 +49,10 @@ compiled program computed something different from the Lean code that had been p
 | [**Patch 0001**](patches/0001-sound-nat-lowering.md) | `Nat` arithmetic was lowered to *wrapping* 64-bit ops and literals were truncated (`2^64 → 0`), so any theorem about `Nat` code said nothing about the binary. | Every `Nat` operation is now exact or aborts the transaction. Each check is backed by a kernel-checked lemma. |
 | [**Patch 0002**](patches/0002-no-silent-payload-loss.md) | An `Option`/sum value flowing through a join point silently lost its payload (`some q` read back as `0`), giving 6,978 wrong results in our suite. | Now a compile error instead of a miscompile. |
 
-Both patches leave all 8 upstream example binaries **byte-identical**, and come with regression tests
-that fail on the unpatched compiler. Reconnaissance also showed that 36 upstream theorems rely on
+Both patches leave every upstream example binary **byte-identical**, and come with regression tests
+that fail on the unpatched compiler. LEMMA tracks upstream; it is merged up to `587ab09` (sBPF v3,
+LiteSVM 0.18.2). Upstream has since fixed `Nat.sub`/`div`/`mod` itself, but against current upstream
+the suite still finds 1,011 failures without LEMMA's patches and 0 with them. Reconnaissance also showed that 36 upstream theorems rely on
 `bv_decide` native-code axioms, and that several headline example theorems are about functions the
 deployed entrypoints never call. Details are in the [Phase 0 report](docs/upstream/phase0-report.md)
 and a [draft upstream issue](docs/upstream/issue-nat-miscompilation.md).
@@ -61,15 +63,18 @@ and a [draft upstream issue](docs/upstream/issue-nat-miscompilation.md).
 |---|---|---|
 | 🧮 **`Lemma.Math`** | 128-bit `mulDiv` (floor/ceil), fixed point, constant-product swap | `mulDiv` returns `some q` **iff** the exact rounded result fits, so it never overflows silently. For the swap, proven on the on-chain function itself: **k never decreases**, **output < reserve**, and **every rounding favours the pool**. |
 | 🛡️ **`Lemma.Spec` + `Lemma.Guard`** | Account-validation predicates and runtime checks | Each check succeeds **exactly when** its predicate holds (signer, writable, owner, key, kind tag, not a duplicate slot), and `guard_bind_ok` lifts that through a whole program. |
-| 🎯 **Entrypoint theorems** | [`GuardedCounter`](Lemma/Examples/GuardedCounter.lean) example | `entrypoint_checks`: whenever the deployed entrypoint succeeds, every account check held. |
+| 💸 **Fee splitter** (component) | [`FeeSplitter`](Lemma/Components/FeeSplitter.lean): splits a program-owned vault's lamports to 3 recipients by bps | Proven on the deployed handlers: shares sum **exactly** to the amount, rounding dust ≤ 2 lamports goes to recipient 0, every balance changes by exactly its share, **lamports are conserved**, the reserve is kept, and **re-initialization is impossible**. |
+| 🧠 **`Lemma.Mem`** | Kernel-only memory lemmas | `readU64 (writeU64 …)` round trip and disjointness without `bv_decide`, which is what makes post-state theorems like the splitter's possible. |
+| 🎯 **Entrypoint theorems** | [`GuardedCounter`](Lemma/Examples/GuardedCounter.lean) example, fee splitter | Whenever the deployed entrypoint succeeds, every account check held, and for the splitter, the accounting above holds. |
 | 🔬 **sBPF test interpreter** | An independent executor for compiled programs | Model-vs-binary differential tests, plus 12 attack scenarios that must be rejected. |
 | 📐 **Test vectors** | [`vectors/*.json`](vectors), 10k cases from the integer specification | Replay them against *any* implementation (Rust, TypeScript, …). |
 | 🔒 **Proof-integrity audit** | `lake exe lemma-audit` | Fails on `sorry`, custom or native axioms, or `Nat` reachable from on-chain code. |
 
-**Verified on the real SVM (LiteSVM, in CI):** all 10,032 JSON vectors pass against the compiled
-programs (`mulDiv` ≤ 1,293 CU, swap ≤ 2,490 CU); every `GuardedCounter` attack is rejected (an honest
-call costs 72 CU, in a 1,216-byte `.so`); and an overflowing `Nat` addition aborts on Agave instead
-of wrapping, as patch 0001 requires.
+**Verified on the real SVM (LiteSVM 0.18.2 / Agave, in CI):**
+- all 10,032 JSON vectors pass against the compiled programs;
+- every `GuardedCounter` attack is rejected;
+- the fee splitter passes Init, exact splits, attacks and 200 random splits with lamports conserved;
+- an overflowing `Nat` addition aborts on Agave instead of wrapping, as patch 0001 requires.
 
 Every theorem has a plain-English statement in [`docs/specs/`](docs/specs/README.md), and everything
 that is **trusted rather than proven** is listed in [`trusted-base.md`](docs/specs/trusted-base.md).
@@ -83,7 +88,7 @@ that is **trusted rather than proven** is listed in [`trusted-base.md`](docs/spe
 | Repo skeleton, CI, secret scanning, supply-chain pinning | ✅ |
 | `Spec/` safety predicates and proven guards | ✅ |
 | **2. DeFi math library** | 🟡 Done: `mulDiv`, fixed point, constant-product swap, JSON vectors. To do: StableSwap solver, interest-rate curves, oracle/decimals conversion, liquidation checks. |
-| **1. Component library** (escrow, vesting, multisig, staking, fee splitter, timelock) | ⬜ Not started. The validation layer and entrypoint-proof pattern they will use is in place (`GuardedCounter`). |
+| **1. Component library** | 🟡 **Fee splitter: done** (proofs, attack tests, LiteSVM, checklist row). Escrow, vesting, multisig, staking, timelock: to do; the validation, memory and entrypoint-proof layers they need are in place. |
 | **4. Differential harness** | 🟡 Lean model vs compiled binary in the interpreter, and on LiteSVM in CI. To do: Rust reference implementations with property-based fuzzing. |
 | **3. IDL + TypeScript client generator** | ⬜ Not started |
 | **6. Size/CU benchmark suite** | ⬜ Not started (upstream's benchmarks still run in CI) |
@@ -128,7 +133,10 @@ Lemma/
   Compiler/NatLowering.lean   lemmas behind compiler patch 0001
   Math/                       Wide (128-bit), MulDiv, FixedPoint, ConstantProduct, Witnesses
   Spec/Accounts.lean          account-validation predicates
-  Guard.lean                  runtime checks proven equivalent to the predicates
+  Guard.lean                  runtime checks proven equivalent to the predicates, composition lemmas
+  Mem.lean                    kernel-only memory lemmas (read-after-write)
+  Parse.lean                  account parsers preserve state
+  Components/FeeSplitter*.lean  fee splitter program + its theorems
   Examples/GuardedCounter.lean  end-to-end example with an entrypoint-level theorem
 tests/
   LemmaTest/                  sBPF interpreter, ABI serializer, differential / vector / attack suites

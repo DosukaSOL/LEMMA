@@ -8,6 +8,7 @@
   Then: instruction data length u64, instruction data, program id[32].
 -/
 import LemmaTest.Harness
+import LeanSVM
 
 namespace LemmaTest.Abi
 open LemmaTest
@@ -50,5 +51,12 @@ def serialize (slots : List Slot) (ix : ByteArray) (programId : ByteArray) : Byt
 
 /-- Data bytes of the account at slot offset `off` (data starts 88 bytes into the entry). -/
 def dataAt (buf : ByteArray) (off : Nat) (len : Nat) : ByteArray := buf.extract (off + 88) (off + 88 + len)
+
+/-- The Lean `SvmState` holding `input` at the VM's input address (all other bytes 0). -/
+def leanState (input : ByteArray) : LeanSVM.SvmState :=
+  { mem := fun a =>
+      if Sbpf.inputStart ≤ a && a < Sbpf.inputStart + input.size.toUInt64 then
+        input.get! (a - Sbpf.inputStart).toNat
+      else 0 }
 
 end LemmaTest.Abi

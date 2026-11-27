@@ -11,6 +11,7 @@
 import LeanSVM
 import Lemma.Spec.Accounts
 import Lemma.Errors
+import Lemma.Mem
 
 namespace Lemma.LErr
 open LeanSVM
@@ -48,6 +49,12 @@ open LeanSVM Lemma.Spec
 
 @[inline] def requireKey (acc : AccountView) (k : Ptr) (code : UInt64) : SolanaM Unit :=
   SolanaM.bind (keyEq (AccountView.keyPtr acc) k) fun ok => SolanaM.require ok code
+
+/-- The 8-byte fields at `p` and `q` do not overlap. Programs use this cheap runtime check
+    (it never fails for distinct real accounts, which are ~10 KiB apart) to discharge the
+    `Mem.Disjoint8` obligations of their post-state theorems without assuming a memory layout. -/
+@[inline] def requireDisjoint (p q : Ptr) : SolanaM Unit :=
+  SolanaM.require (q - p ≥ 8 && p - q ≥ 8) Err.invalidArgument
 
 @[inline] def requireTag (acc : AccountView) (tag : UInt64) : SolanaM Unit :=
   SolanaM.bind (rawLoadU64 (acc + ABI.accDataLenOffset)) fun len =>
@@ -120,6 +127,76 @@ theorem requireTag_guard (acc : AccountView) (tag : UInt64) :
     · have ht : ¬ s.readU64 (acc + ABI.accDataOffset) = tag := fun ht => h ⟨hl, ht⟩
       simp [hl, ht, SolanaM.bind, rawLoadU64, SolanaM.fail]
     · simp [hl, SolanaM.fail]
+
+theorem requireDisjoint_guard (p q : Ptr) :
+    IsGuard (requireDisjoint p q) (fun _ => Mem.Disjoint8 p q) Err.invalidArgument := by
+  intro s
+  simp only [requireDisjoint, SolanaM.require, Mem.Disjoint8]
+  constructor
+  · rintro ⟨h1, h2⟩
+    have : (q - p ≥ 8 && p - q ≥ 8) = true := by
+      simp only [Bool.and_eq_true, decide_eq_true_eq, GE.ge, UInt64.le_iff_toNat_le]
+      exact ⟨h1, h2⟩
+    simp [this, SolanaM.pure]
+  · intro h
+    have : (q - p ≥ 8 && p - q ≥ 8) = false := by
+      simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, GE.ge, UInt64.le_iff_toNat_le]
+      by_cases h1 : 8 ≤ (q - p).toNat
+      · exact Or.inr (fun h2 => h ⟨h1, h2⟩)
+      · exact Or.inl h1
+    simp [this, SolanaM.fail]
+
+/-! ### Composition lemmas for stepping through a successful run -/
+
+theorem bind_ok_inv {α β} {m : SolanaM α} {k : α → SolanaM β} {s s' : SvmState} {v : β}
+    (h : SolanaM.bind m k s = .ok v s') : ∃ a s1, m s = .ok a s1 ∧ k a s1 = .ok v s' := by
+  unfold SolanaM.bind at h
+  split at h
+  · rename_i a s1 hm; exact ⟨a, s1, hm, h⟩
+  · cases h
+
+theorem require_bind_ok {β} {c : Bool} {e : UInt64} {k : Unit → SolanaM β} {s s' : SvmState} {v : β}
+    (h : SolanaM.bind (SolanaM.require c e) k s = .ok v s') : c = true ∧ k () s = .ok v s' := by
+  unfold SolanaM.bind SolanaM.require at h
+  cases c
+  · simp [SolanaM.fail] at h
+  · exact ⟨rfl, by simpa [SolanaM.pure] using h⟩
+
+@[simp] theorem bind_rawLoadU64 {β} (p : Ptr) (k : UInt64 → SolanaM β) (s : SvmState) :
+    SolanaM.bind (rawLoadU64 p) k s = k (s.readU64 p) s := rfl
+
+@[simp] theorem bind_rawLoadU8 {β} (p : Ptr) (k : UInt8 → SolanaM β) (s : SvmState) :
+    SolanaM.bind (rawLoadU8 p) k s = k (s.readU8 p) s := rfl
+
+@[simp] theorem bind_rawStoreU64 {β} (p v : UInt64) (k : Unit → SolanaM β) (s : SvmState) :
+    SolanaM.bind (rawStoreU64 p v) k s = k () (s.writeU64 p v) := rfl
+
+/-- A successful `checkedAdd64` returns the exact sum and leaves the state unchanged. -/
+theorem checkedAdd64_ok {a b r : UInt64} {s s' : SvmState} (h : checkedAdd64 a b s = .ok r s') :
+    s' = s ∧ r.toNat = a.toNat + b.toNat := by
+  unfold checkedAdd64 at h
+  simp only [Bind.bind, Pure.pure] at h
+  obtain ⟨hc, h⟩ := require_bind_ok h
+  simp only [SolanaM.pure] at h
+  cases h
+  refine ⟨rfl, ?_⟩
+  simp only [decide_eq_true_eq, GE.ge, UInt64.le_iff_toNat_le, UInt64.toNat_add] at hc
+  have := a.toNat_lt; have := b.toNat_lt
+  rw [UInt64.toNat_add]
+  rcases Nat.lt_or_ge (a.toNat + b.toNat) (2^64) with h' | h'
+  · exact Nat.mod_eq_of_lt h'
+  · exfalso; rw [Nat.mod_eq_sub_mod h', Nat.mod_eq_of_lt (by omega)] at hc; omega
+
+/-- A successful `checkedSub64` returns the exact difference and leaves the state unchanged. -/
+theorem checkedSub64_ok {a b r e : UInt64} {s s' : SvmState} (h : checkedSub64 a b e s = .ok r s') :
+    s' = s ∧ b.toNat ≤ a.toNat ∧ r.toNat = a.toNat - b.toNat := by
+  unfold checkedSub64 at h
+  simp only [Bind.bind, Pure.pure] at h
+  obtain ⟨hc, h⟩ := require_bind_ok h
+  simp only [SolanaM.pure] at h
+  cases h
+  simp only [decide_eq_true_eq, GE.ge, UInt64.le_iff_toNat_le] at hc
+  exact ⟨rfl, hc, UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr hc)⟩
 
 /-- If a program that starts with a guard succeeds, the guard's predicate held initially, and
     the rest of the program ran from the unchanged state. -/
