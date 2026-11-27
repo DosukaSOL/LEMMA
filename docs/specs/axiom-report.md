@@ -67,7 +67,7 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 
 ## Upstream lean-svm theorems (informational)
 
-621 theorems; 585 use only the standard axioms; 36 depend on `bv_decide` native-evaluation axioms, so they trust the compiled LRAT checker as well as the kernel:
+767 theorems; 719 use only the standard axioms; 48 depend on `bv_decide` native-evaluation axioms, so they trust the compiled LRAT checker as well as the kernel:
 
 - `Examples.Counter.counter_increment_adds_one`
 - `Examples.Lending.lending_initObligation_zero_inits_dirty_mem`
@@ -77,8 +77,15 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 - `LeanSVM.CPI.pubkeyCopy_preserves_outside`
 - `LeanSVM.CPI.zeroWords_exact`
 - `LeanSVM.Compiler.Proofs.BinOp.isCommutative_sound`
+- `LeanSVM.Compiler.Proofs.BinOp.maskShiftImm_sound`
 - `LeanSVM.Compiler.Proofs.CmpOp.flip_sound`
+- `LeanSVM.Compiler.Proofs.VRange.evalBinImm_sound`
+- `LeanSVM.Compiler.Proofs.VRange.evalBinOp_sound`
+- `LeanSVM.Compiler.Proofs.VRange.forMemSize_sound`
+- `LeanSVM.Compiler.Proofs.VRange.lowBitMask_noop_sound`
+- `LeanSVM.Compiler.Proofs.checkAllocCert_bridges_emitStmt_binOp`
 - `LeanSVM.Compiler.Proofs.div64_pow2_eq_rsh64`
+- `LeanSVM.Compiler.Proofs.divMod_hasSideEffect_sound`
 - `LeanSVM.Compiler.Proofs.emitParallelLocMoves_stackSwap_sound`
 - `LeanSVM.Compiler.Proofs.emitSingleLocMove_sound`
 - `LeanSVM.Compiler.Proofs.emitStmt_binImm_sound`
@@ -96,15 +103,20 @@ Allowed axioms for LEMMA theorems: `propext`, `Classical.choice`, `Quot.sound`.
 - `LeanSVM.Compiler.Proofs.mod64_pow2_eq_and64`
 - `LeanSVM.Compiler.Proofs.mul64_pow2_eq_lsh64`
 - `LeanSVM.Compiler.Proofs.opt_algebraic_identities`
+- `LeanSVM.Compiler.Proofs.peephole_redundant_mov32_elim_sound`
 - `LeanSVM.Compiler.Proofs.peephole_stx_ldx_b8_diff_sound`
 - `LeanSVM.Compiler.Proofs.peephole_stx_ldx_b8_same_sound`
+- `LeanSVM.Compiler.Proofs.planMemsetStores_sound`
 - `LeanSVM.Compiler.Proofs.pushRawInsn_roundtrip`
 - `LeanSVM.Compiler.Proofs.storeVReg_sound`
+- `LeanSVM.Compiler.Proofs.subImm_to_addImm_sound`
 - `LeanSVM.Math.mulDiv64Ceil_ok_spec`
 - `LeanSVM.Math.mulDiv64_ok_spec`
 - `LeanSVM.SvmState.mem_writeU64_outside`
+- `LeanSVM.SvmState.memcmpLoop_eq_zero_iff`
 - `LeanSVM.SvmState.readU64_writeU64_disjoint`
 - `LeanSVM.SvmState.readU64_writeU64_same`
+- `LeanSVM.sysGetClock_spec`
 
 ## Runtime `Nat` lint (37 LEMMA runtime definitions)
 

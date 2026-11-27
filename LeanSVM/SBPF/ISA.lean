@@ -1,16 +1,11 @@
 /-
   LeanSVM.SBPF.ISA
-  Native Solana sBPF (V0 & V3) Instruction Set Architecture, exact 8-byte little-endian
-  machine code encoder, Murmur3-32 static syscall hasher, and built-in disassembler.
+  Native Solana sBPF v3 (SIMD-0178 static syscalls + SIMD-0189 strict ELF + SIMD-0377)
+  Instruction Set Architecture, exact 8-byte little-endian machine code encoder,
+  Murmur3-32 static syscall hasher, and built-in disassembler.
 -/
 
 namespace LeanSVM.SBPF
-
-/-- Target Solana SBPF ISA version. -/
-inductive Version where
-  | v0  -- Classic Solana sBPF (mainnet/devnet/Agave/LiteSVM universal default)
-  | v3  -- Strict SBPFv3 (static syscalls, PQR ops, zero relocations)
-  deriving Repr, BEq, DecidableEq
 
 /-- Physical sBPF registers (`r0`..`r10`).
     - `r0`: return value / scratch
@@ -47,6 +42,12 @@ inductive MemSize where
 inductive AluOp where
   | add | sub | mul | div | or | and | lsh | rsh | mod | xor | mov | arsh
   deriving Repr, BEq, DecidableEq
+
+/-- True iff Solana sBPF (both v0 and v3) sign-extends the 32-bit result of `op` into
+    bits `32..63` (`i32 → i64 → u64`) instead of zero-extending (`u32 → u64`). -/
+def AluOp.signExtendsInAlu32 : AluOp → Bool
+  | .add | .sub | .mul => true
+  | _ => false
 
 /-- Conditional jump predicate. -/
 inductive JmpCond where
@@ -104,13 +105,11 @@ inductive Insn where
   deriving Repr, BEq, Inhabited
 
 /-- Number of 8-byte sBPF instruction slots occupied by an instruction. -/
-def Insn.slotCount (ver : Version := .v0) : Insn → Nat
-  | .label _       => 0
-  | .lddw _ _      => 2
+def Insn.slotCount : Insn → Nat
+  | .label _        => 0
+  | .lddw _ _       => 2
   | .lddwRodata _ _ => 2
-  | _              =>
-    let _ := ver
-    1
+  | _               => 1
 
 /-! ### Little-Endian ByteArray Encoding Helpers -/
 
@@ -141,7 +140,7 @@ def pushRawInsn (buf : ByteArray) (opc : UInt8) (dst src : UInt8) (off : Int16) 
 
 /-! ### Exact Solana sBPF Opcode Tables -/
 
-private def aluBaseOpc : AluOp → UInt8
+def aluBaseOpc : AluOp → UInt8
   | .add  => 0x00
   | .sub  => 0x10
   | .mul  => 0x20
@@ -168,51 +167,40 @@ private def jmpBaseOpc : JmpCond → UInt8
   | .slt => 0xc0
   | .sle => 0xd0
 
-private def ldxOpc (ver : Version) : MemSize → UInt8
-  | .b1 => match ver with | .v0 => 0x71 | .v3 => 0x2c
-  | .b2 => match ver with | .v0 => 0x69 | .v3 => 0x3c
-  | .b4 => match ver with | .v0 => 0x61 | .v3 => 0x8c
-  | .b8 => match ver with | .v0 => 0x79 | .v3 => 0x9c
+/-! ### Exact Solana sBPF v3 Opcode Tables (SIMD-0178 + SIMD-0189 + SIMD-0377) -/
 
-private def stxOpc (ver : Version) : MemSize → UInt8
-  | .b1 => match ver with | .v0 => 0x73 | .v3 => 0x2f
-  | .b2 => match ver with | .v0 => 0x6b | .v3 => 0x3f
-  | .b4 => match ver with | .v0 => 0x63 | .v3 => 0x8f
-  | .b8 => match ver with | .v0 => 0x7b | .v3 => 0x9f
+def ldxOpc : MemSize → UInt8
+  | .b1 => 0x71
+  | .b2 => 0x69
+  | .b4 => 0x61
+  | .b8 => 0x79
 
-private def stImmOpc (ver : Version) : MemSize → UInt8
-  | .b1 => match ver with | .v0 => 0x72 | .v3 => 0x27
-  | .b2 => match ver with | .v0 => 0x6a | .v3 => 0x37
-  | .b4 => match ver with | .v0 => 0x62 | .v3 => 0x87
-  | .b8 => match ver with | .v0 => 0x7a | .v3 => 0x97
+def stxOpc : MemSize → UInt8
+  | .b1 => 0x73
+  | .b2 => 0x6b
+  | .b4 => 0x63
+  | .b8 => 0x7b
 
-private def alu64RegOpc (ver : Version) (op : AluOp) : UInt8 :=
-  match ver, op with
-  | .v3, .mul => 0x9e  -- LMUL64_REG (BPF_PQR | BPF_B | BPF_X | BPF_LMUL)
-  | .v3, .div => 0x5e  -- UDIV64_REG
-  | .v3, .mod => 0x7e  -- UREM64_REG
-  | _,   _    => aluBaseOpc op ||| 0x0f -- BPF_ALU64 | BPF_X
+def stImmOpc : MemSize → UInt8
+  | .b1 => 0x72
+  | .b2 => 0x6a
+  | .b4 => 0x62
+  | .b8 => 0x7a
 
-private def alu64ImmOpc (ver : Version) (op : AluOp) : UInt8 :=
-  match ver, op with
-  | .v3, .mul => 0x96  -- LMUL64_IMM
-  | .v3, .div => 0x56  -- UDIV64_IMM
-  | .v3, .mod => 0x76  -- UREM64_IMM
-  | _,   _    => aluBaseOpc op ||| 0x07 -- BPF_ALU64 | BPF_K
+def alu64RegOpc (op : AluOp) : UInt8 :=
+  aluBaseOpc op ||| 0x0f -- BPF_ALU64 | BPF_X
 
-private def alu32RegOpc (ver : Version) (op : AluOp) : UInt8 :=
-  match ver, op with
-  | .v3, .mul => 0x8e  -- LMUL32_REG
-  | .v3, .div => 0x4e  -- UDIV32_REG
-  | .v3, .mod => 0x6e  -- UREM32_REG
-  | _,   _    => aluBaseOpc op ||| 0x0c -- BPF_ALU32 | BPF_X
+def alu64ImmOpc (op : AluOp) : UInt8 :=
+  aluBaseOpc op ||| 0x07 -- BPF_ALU64 | BPF_K
 
-private def alu32ImmOpc (ver : Version) (op : AluOp) : UInt8 :=
-  match ver, op with
-  | .v3, .mul => 0x86  -- LMUL32_IMM
-  | .v3, .div => 0x46  -- UDIV32_IMM
-  | .v3, .mod => 0x66  -- UREM32_IMM
-  | _,   _    => aluBaseOpc op ||| 0x04 -- BPF_ALU32 | BPF_K
+def alu32RegOpc (op : AluOp) : UInt8 :=
+  aluBaseOpc op ||| 0x0c -- BPF_ALU32 | BPF_X
+
+def alu32ImmOpc (op : AluOp) : UInt8 :=
+  aluBaseOpc op ||| 0x04 -- BPF_ALU32 | BPF_K
+
+/-- Opcode for unary 64-bit negation (`dst = -dst`): `0x87` (`NEG64`). -/
+def neg64Opc : UInt8 := 0x87
 
 /-! ### Murmur3-32 Hasher (exact match to Solana `ebpf::hash_symbol_name`) -/
 
@@ -261,35 +249,17 @@ def murmur3_32 (bytes : ByteArray) : UInt32 := Id.run do
 def hashSyscallName (name : String) : UInt32 :=
   murmur3_32 name.toUTF8
 
-/-! ### Assembler (2-pass label resolution -> raw `.text` + syscall relocations) -/
+/-! ### Assembler (2-pass label resolution -> raw sBPF v3 `.text`, zero relocations) -/
 
-/-- Relocation record for V0 external syscall calls (`R_BPF_64_32`). -/
-structure SyscallReloc where
-  /-- Byte offset within `.text` of the `call -1` instruction. -/
-  textByteOffset : UInt64
-  /-- Syscall symbol name (e.g. `"sol_log_"`). -/
-  symName : String
-  deriving Repr, BEq
-
-/-- Relocation record for `.rodata` pointer loads (optional; we also embed direct MM_RODATA_START VA). -/
-structure RodataFixup where
-  /-- Byte offset within `.text` of the `lddw` instruction. -/
-  textByteOffset : UInt64
-  /-- Byte offset within `.rodata`. -/
-  rodataOff : UInt32
-  deriving Repr, BEq
-
-/-- Result of assembling a symbolic sBPF instruction list. -/
+/-- Result of assembling a symbolic sBPF v3 instruction list. -/
 structure AssembledText where
-  bytes         : ByteArray
-  insnCount     : Nat
-  syscallRelocs : Array SyscallReloc
-  rodataFixups  : Array RodataFixup
+  bytes     : ByteArray
+  insnCount : Nat
 
-/-- Assemble symbolic `Array Insn` into `.text` bytecode.
-    `rodataBaseVaddr` is the exact VM virtual address of `.rodata` (`0x100000000 + rodataShOffset` for V0,
-    `0x100000000` for V3). -/
-def assemble (insns : Array Insn) (ver : Version := .v0) (rodataBaseVaddr : UInt64 := 0x100000000) :
+/-- Assemble symbolic `Array Insn` into Solana sBPF v3 `.text` bytecode (SIMD-0178 static syscalls,
+    0 relocations). `rodataBaseVaddr` is the exact VM virtual address of `.rodata` (`0x8` when
+    non-empty so no `.rodata` pointer is ever NULL `0x0`, or `0` when empty). -/
+def assemble (insns : Array Insn) (rodataBaseVaddr : UInt64 := 0) :
     Except String AssembledText := do
   -- Pass 1: record PC (in 8-byte instruction slots) of each label
   let mut labelPc : List (String × Nat) := []
@@ -297,73 +267,53 @@ def assemble (insns : Array Insn) (ver : Version := .v0) (rodataBaseVaddr : UInt
   for insn in insns do
     match insn with
     | .label name => labelPc := (name, pc) :: labelPc
-    | _ => pc := pc + insn.slotCount ver
+    | _ => pc := pc + insn.slotCount
   let findLabel (name : String) : Except String Nat :=
     match labelPc.find? (fun p => p.1 == name) with
     | some (_, targetPc) => .ok targetPc
     | none => .error s!"undefined sBPF label: {name}"
   -- Pass 2: encode every instruction
   let mut buf := ByteArray.emptyWithCapacity (pc * 8)
-  let mut relocs : Array SyscallReloc := #[]
-  let mut roFixups : Array RodataFixup := #[]
   let mut curPc : Nat := 0
   for insn in insns do
     match insn with
     | .label _ => pure ()
     | .alu64Reg op dst src =>
-      buf := pushRawInsn buf (alu64RegOpc ver op) dst.idx src.idx 0 0
+      buf := pushRawInsn buf (alu64RegOpc op) dst.idx src.idx 0 0
       curPc := curPc + 1
     | .alu64Imm op dst imm =>
-      buf := pushRawInsn buf (alu64ImmOpc ver op) dst.idx 0 0 imm.toUInt32
+      buf := pushRawInsn buf (alu64ImmOpc op) dst.idx 0 0 imm.toUInt32
       curPc := curPc + 1
     | .alu32Reg op dst src =>
-      buf := pushRawInsn buf (alu32RegOpc ver op) dst.idx src.idx 0 0
+      buf := pushRawInsn buf (alu32RegOpc op) dst.idx src.idx 0 0
       curPc := curPc + 1
     | .alu32Imm op dst imm =>
-      buf := pushRawInsn buf (alu32ImmOpc ver op) dst.idx 0 0 imm.toUInt32
+      buf := pushRawInsn buf (alu32ImmOpc op) dst.idx 0 0 imm.toUInt32
       curPc := curPc + 1
     | .neg64 dst =>
-      buf := pushRawInsn buf 0x87 dst.idx 0 0 0
+      buf := pushRawInsn buf neg64Opc dst.idx 0 0 0
       curPc := curPc + 1
     | .lddw dst imm =>
-      match ver with
-      | .v0 =>
-        let lo := imm.toUInt32
-        let hi := (imm >>> 32).toUInt32
-        buf := pushRawInsn buf 0x18 dst.idx 0 0 lo
-        buf := pushRawInsn buf 0x00 0 0 0 hi
-        curPc := curPc + 2
-      | .v3 =>
-        let lo := imm.toUInt32
-        let hi := (imm >>> 32).toUInt32
-        -- mov32 zero-extends lo, then hor64 ORs hi << 32
-        buf := pushRawInsn buf 0xb4 dst.idx 0 0 lo
-        buf := pushRawInsn buf 0xf7 dst.idx 0 0 hi
-        curPc := curPc + 2
+      let lo := imm.toUInt32
+      let hi := (imm >>> 32).toUInt32
+      buf := pushRawInsn buf 0x18 dst.idx 0 0 lo
+      buf := pushRawInsn buf 0x00 0 0 0 hi
+      curPc := curPc + 2
     | .lddwRodata dst roOff =>
       let va := rodataBaseVaddr + roOff.toUInt64
-      roFixups := roFixups.push { textByteOffset := (curPc * 8).toUInt64, rodataOff := roOff }
-      match ver with
-      | .v0 =>
-        let lo := va.toUInt32
-        let hi := (va >>> 32).toUInt32
-        buf := pushRawInsn buf 0x18 dst.idx 0 0 lo
-        buf := pushRawInsn buf 0x00 0 0 0 hi
-        curPc := curPc + 2
-      | .v3 =>
-        let lo := va.toUInt32
-        let hi := (va >>> 32).toUInt32
-        buf := pushRawInsn buf 0xb4 dst.idx 0 0 lo
-        buf := pushRawInsn buf 0xf7 dst.idx 0 0 hi
-        curPc := curPc + 2
+      let lo := va.toUInt32
+      let hi := (va >>> 32).toUInt32
+      buf := pushRawInsn buf 0x18 dst.idx 0 0 lo
+      buf := pushRawInsn buf 0x00 0 0 0 hi
+      curPc := curPc + 2
     | .ldx sz dst src off =>
-      buf := pushRawInsn buf (ldxOpc ver sz) dst.idx src.idx off 0
+      buf := pushRawInsn buf (ldxOpc sz) dst.idx src.idx off 0
       curPc := curPc + 1
     | .stx sz dst src off =>
-      buf := pushRawInsn buf (stxOpc ver sz) dst.idx src.idx off 0
+      buf := pushRawInsn buf (stxOpc sz) dst.idx src.idx off 0
       curPc := curPc + 1
     | .stImm sz dst off imm =>
-      buf := pushRawInsn buf (stImmOpc ver sz) dst.idx 0 off imm.toUInt32
+      buf := pushRawInsn buf (stImmOpc sz) dst.idx 0 off imm.toUInt32
       curPc := curPc + 1
     | .ja target =>
       let tPc ← findLabel target
@@ -391,26 +341,20 @@ def assemble (insns : Array Insn) (ver : Version := .v0) (rodataBaseVaddr : UInt
     | .callLocal target =>
       let tPc ← findLabel target
       let delta : Int := (tPc : Int) - ((curPc + 1 : Nat) : Int)
-      let srcField : UInt8 := match ver with | .v0 => 1 | .v3 => 0
-      -- In V0: CALL_IMM (0x85) with imm != -1 is a PC-relative internal call
-      -- In V3: CALL_IMM (0x85) with src=0 is a PC-relative internal call
-      buf := pushRawInsn buf 0x85 0 srcField 0 (Int32.ofInt delta).toUInt32
+      if delta == -1 then
+        throw s!"invalid self-call (delta = -1) to label {target}"
+      -- sBPF v3 (SIMD-0178): CALL_IMM (0x85) with src=1 is a PC-relative internal call
+      buf := pushRawInsn buf 0x85 0 1 0 (Int32.ofInt delta).toUInt32
       curPc := curPc + 1
     | .callSyscall symName =>
-      match ver with
-      | .v0 =>
-        relocs := relocs.push { textByteOffset := (curPc * 8).toUInt64, symName }
-        buf := pushRawInsn buf 0x85 0 0 0 0xFFFFFFFF
-        curPc := curPc + 1
-      | .v3 =>
-        let h := hashSyscallName symName
-        buf := pushRawInsn buf 0x95 0 0 0 h
-        curPc := curPc + 1
-    | .exit =>
-      let opc : UInt8 := match ver with | .v0 => 0x95 | .v3 => 0x9d
-      buf := pushRawInsn buf opc 0 0 0 0
+      -- sBPF v3 (SIMD-0178): CALL_IMM (0x85) with src=0, imm=murmur3_32(symName) (0 relocations!)
+      let h := hashSyscallName symName
+      buf := pushRawInsn buf 0x85 0 0 0 h
       curPc := curPc + 1
-  return { bytes := buf, insnCount := curPc, syscallRelocs := relocs, rodataFixups := roFixups }
+    | .exit =>
+      buf := pushRawInsn buf 0x95 0 0 0 0
+      curPc := curPc + 1
+  return { bytes := buf, insnCount := curPc }
 
 /-! ### Built-In sBPF Disassembler -/
 
@@ -459,5 +403,62 @@ def formatInsn : Insn → String
 
 def formatProgram (insns : Array Insn) : String :=
   String.intercalate "\n" (insns.toList.map formatInsn)
+
+/-! ### Clean-Room Assembler Slot & Byte-Size Soundness (0 `sorry`, 0 custom axioms) -/
+
+theorem pushRawInsn_size (buf : ByteArray) (opc dst src : UInt8) (off : Int16) (imm : UInt32) :
+    (pushRawInsn buf opc dst src off imm).size = buf.size + 8 := by
+  simp only [pushRawInsn, pushU16LE, pushU32LE, ByteArray.size_push]
+
+private theorem except_bind_ok {α β ε : Type} {x : Except ε α} {f : α → Except ε β} {r : β}
+    (h : (x >>= f) = .ok r) : ∃ a, x = .ok a ∧ f a = .ok r := by
+  cases x with
+  | error e => cases h
+  | ok a => exact ⟨a, rfl, h⟩
+
+private theorem list_forIn_except_inv {α σ ε : Type}
+    (xs : List α) (w : α → Nat) (body : α → σ → Except ε (ForInStep σ)) (Inv : Nat → σ → Prop)
+    (hStep : ∀ x k s step, Inv k s → body x s = .ok step →
+      ∃ s', step = .yield s' ∧ Inv (k + w x) s') :
+    ∀ k s out, Inv k s → forIn xs s body = .ok out → Inv (k + (xs.map w).sum) out := by
+  induction xs with
+  | nil =>
+    intro k s out hI h
+    change Except.ok s = Except.ok out at h
+    cases h
+    simpa using hI
+  | cons x tl ih =>
+    intro k s out hI h
+    rw [List.forIn_cons] at h
+    obtain ⟨step, hB, hRest⟩ := except_bind_ok h
+    obtain ⟨s', rfl, hI'⟩ := hStep x k s step hI hB
+    simpa [Nat.add_assoc] using ih (k + w x) s' out hI' hRest
+
+/-- Every successful sBPF v3 assembly emits exact `insnCount = ∑ Insn.slotCount`
+    and `bytes.size = 8 * insnCount` (zero Pass-1/Pass-2 PC drift or byte-alignment skew!). -/
+theorem assemble_slot_and_byte_size (insns : Array Insn) (rodataBaseVaddr : UInt64)
+    (out : AssembledText) (h : assemble insns rodataBaseVaddr = .ok out) :
+    out.insnCount = (insns.toList.map Insn.slotCount).sum ∧
+    out.bytes.size = 8 * out.insnCount := by
+  unfold assemble at h
+  obtain ⟨_, _, h⟩ := except_bind_ok h
+  obtain ⟨st, hLoop, hRet⟩ := except_bind_ok h
+  cases hRet
+  rw [← Array.forIn_toList] at hLoop
+  let Inv : Nat → ByteArray × Nat → Prop :=
+    fun k s => s.2 = k ∧ s.1.size = 8 * s.2
+  have hFinal : Inv (0 + (insns.toList.map Insn.slotCount).sum) st := by
+    refine list_forIn_except_inv insns.toList Insn.slotCount _ Inv ?_ 0 _ st ⟨rfl, rfl⟩ hLoop
+    intro insn k s step ⟨hk, hb⟩ hB
+    cases insn <;> dsimp only [Insn.slotCount] at hB ⊢
+    all_goals
+      simp only [bind, Except.bind, pure, Except.pure, throw, throwThe] at hB
+      repeat' split at hB
+      all_goals cases hB
+      all_goals
+        refine ⟨_, rfl, ?_⟩
+        simp only [Inv, pushRawInsn_size]
+        constructor <;> omega
+  simpa [Inv] using hFinal
 
 end LeanSVM.SBPF

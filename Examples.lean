@@ -6,3 +6,4 @@ import Examples.Amm
 import Examples.Lending
 import Examples.DutchAuction
 import Examples.BondingCurve
+import Examples.CompilerRegression

@@ -5,7 +5,12 @@
 
 # Two silent miscompilations: wrapping `Nat` arithmetic, and dropped constructor payloads
 
-**Commit:** `d49665eac029d0a53a8f8fc324d840df6e9649d5`
+**Commit:** first observed at `d49665e`; re-checked at `587ab09` (sBPF v3).
+
+**Status at `587ab09`:** `Nat.sub` (saturating) and `Nat.div`/`Nat.mod` by zero are fixed upstream.
+Still open: `Nat.add`/`Nat.mul` wrap, `Nat` literals ≥ 2^64 are truncated (`valToReg`:
+`.natLit n => emitConst n.toUInt64`), `lowerDivModScalar` reduces a literal `Nat` divisor
+mod 2^64 (`x / (2^64+1)` → `x / 1`), and the payload-drop bug below.
 
 ## Summary
 

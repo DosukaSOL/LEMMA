@@ -1,0 +1,248 @@
+diff --git a/LeanSVM/Compiler/Lower.lean b/LeanSVM/Compiler/Lower.lean
+index 24bd7b1..f9336a1 100644
+--- a/LeanSVM/Compiler/Lower.lean
++++ b/LeanSVM/Compiler/Lower.lean
+@@ -174,20 +174,63 @@ private def getOrAllocArgsPack (needBytes : Nat) : LowerM (VReg × Int16) := do
+     emit (.stackAddr r newOff)
+     return (r, newOff)
+ 
++/-! ### LEMMA patch 0001: sound `Nat` lowering
++
++Upstream lowered `Nat` to wrapping 64-bit arithmetic and truncated `Nat` literals modulo
++2^64, so compiled code could silently disagree with the Lean definitions that proofs are
++about. With this patch, every `Nat` value held in a register is the exact mathematical value
++(always `< 2^64`), or the program has aborted:
++
++* literals `≥ 2^64` are a compile-time error,
++* `Nat.add` / `Nat.mul` abort (Solana `abort` syscall) on overflow,
++* `Nat.sub` saturates at 0, `Nat.div x 0 = 0`, `Nat.mod x 0 = x` (exactly Lean's semantics),
++* `UIntN.ofNatTruncate` clamps instead of masking.
++
++The `abort` syscall terminates the whole instruction even from inside an outlined helper,
++unlike `exit`. See `patches/0001-sound-nat-lowering.md` and
++`Lemma/Compiler/NatLowering.lean` for the kernel-checked correctness argument. -/
++
++/-- Materialize an exact `Nat` literal, refusing to truncate values that do not fit in 64 bits. -/
++private def natLitToReg (n : Nat) : LowerM VReg := do
++  if n ≥ 2 ^ 64 then
++    throw s!"Nat literal {n} does not fit in 64 bits (LEMMA patch 0001 refuses to truncate it)"
++  let r ← freshVReg
++  emit (.constImm r n.toUInt64)
++  return r
++
++/-- Create (without switching to it) a block that unconditionally aborts the program. -/
++private def newAbortBlock : LowerM BlockId := do
++  let saved := (← get).curBlock
++  let b ← newBlock
++  switchBlock b
++  emit (.syscall none "abort" #[])
++  setTerm .unreach
++  switchBlock saved
++  return b
++
+ /-- Materialize a `Val` as a single scalar `VReg`. -/
+ private def valToReg (v : Val) : LowerM VReg := do
+   match v with
+   | .reg r => return r
+-  | .natLit n => emitConst n.toUInt64
++  | .natLit n => natLitToReg n
+   | .erased => emitConst 0
+   | .ctorVal tag #[] => emitConst tag.toUInt64
+   | .ctorVal tag #[.erased] => emitConst tag.toUInt64
+   | .ctorVal 0 #[a, .erased] => valToReg a
+   | .ctorVal tag #[a] =>
+     -- Single-field wrapper (e.g. `UInt64.mk`, `BitVec.ofFin`, `Fin.mk`)
+-    if tag == 0 then valToReg a else emitConst tag.toUInt64
++    if tag == 0 then valToReg a
++    else
++      -- LEMMA patch 0002: upstream returned only the tag here, silently discarding the
++      -- payload (e.g. `Option.some q` became `1`, and `q` was later read back as 0).
++      match a with
++      | .erased => emitConst tag.toUInt64
++      | _ => throw s!"constructor (tag {tag}) with a runtime payload cannot be passed through a single-register slot (e.g. an `Option`/sum value flowing through an `if` join point or a multi-branch return); restructure the code (LEMMA patch 0002)"
+   | .structVal #[a] => valToReg a
+-  | .dynCtor tag _ => return tag
++  | .dynCtor tag payloads =>
++    -- LEMMA patch 0002: same silent payload loss for dynamically-tagged constructors.
++    if payloads.isEmpty then return tag
++    else throw s!"dynamically-tagged constructor with {payloads.size} runtime payload(s) cannot be passed through a single-register slot (LEMMA patch 0002)"
+   | other => throw s!"expected scalar value for register, got: {repr other}"
+ 
+ /-- Extract compile-time constant `Nat` if available (for `stackAlloc`, widths, etc.). -/
+@@ -235,7 +278,7 @@ private def lowerEntryReturn (v : Val) : LowerM Unit := do
+   match v with
+   | .reg r => setTerm (.ret r)
+   | .natLit n =>
+-    let r ← emitConst n.toUInt64
++    let r ← natLitToReg n
+     setTerm (.ret r)
+   | .erased =>
+     let r ← emitConst 0
+@@ -271,7 +314,7 @@ private def flattenVal (v : Val) : LowerM (Array VReg) := do
+   match v with
+   | .erased => return #[]
+   | .reg r => return #[r]
+-  | .natLit n => return #[← emitConst n.toUInt64]
++  | .natLit n => return #[← natLitToReg n]
+   | .strLit off len =>
+     let rOff ← freshVReg
+     emit (.constRodata rOff off)
+@@ -387,6 +430,86 @@ private def lowerCmpScalar (op : CmpOp) (a b : Val) : LowerM Val := do
+   emit (.cmp op dst ra rb)
+   return .reg dst
+ 
++/-- LEMMA patch 0001: `Nat.add`, exact or abort. Overflow of `a + b` (mod 2^64) ⇔ `r < a`. -/
++private def lowerNatAdd (a b : Val) : LowerM Val := do
++  let ra ← valToReg a
++  let rb ← valToReg b
++  let r ← freshVReg
++  emit (.binOp .add64 r ra rb)
++  let abortB ← newAbortBlock
++  let cont ← newBlock
++  setTerm (.brCmp .ult r ra abortB #[] cont #[])
++  switchBlock cont
++  return .reg r
++
++/-- LEMMA patch 0001: `Nat.mul`, exact or abort.
++    Overflow ⇔ `a ≠ 0 ∧ (a * b mod 2^64) / a ≠ b`. -/
++private def lowerNatMul (a b : Val) : LowerM Val := do
++  let ra ← valToReg a
++  let rb ← valToReg b
++  let r ← freshVReg
++  emit (.binOp .mul64 r ra rb)
++  let abortB ← newAbortBlock
++  let chk ← newBlock
++  let cont ← newBlock
++  setTerm (.brCmpImm .eq ra 0 cont #[] chk #[])
++  switchBlock chk
++  let q ← freshVReg
++  emit (.binOp .div64 q r ra)
++  setTerm (.brCmp .ne q rb abortB #[] cont #[])
++  switchBlock cont
++  return .reg r
++
++/-- Two-way select joined through a block parameter: `if lhs op rhs then thenV else elseV`,
++    where the two arms are emitted by `mkThen` / `mkElse` in fresh blocks. -/
++private def lowerSelect (op : CmpOp) (lhs rhs : VReg)
++    (mkThen mkElse : LowerM VReg) : LowerM Val := do
++  let p ← freshVReg
++  let tB ← newBlock
++  let eB ← newBlock
++  let join ← newBlock #[p]
++  setTerm (.brCmp op lhs rhs tB #[] eB #[])
++  switchBlock tB
++  let tv ← mkThen
++  setTerm (.jmp join #[tv])
++  switchBlock eB
++  let ev ← mkElse
++  setTerm (.jmp join #[ev])
++  switchBlock join
++  return .reg p
++
++/-- LEMMA patch 0001: `Nat.sub` truncates at zero (exact Lean semantics). -/
++private def lowerNatSub (a b : Val) : LowerM Val := do
++  let ra ← valToReg a
++  let rb ← valToReg b
++  lowerSelect .ult ra rb (emitConst 0) (do
++    let d ← freshVReg; emit (.binOp .sub64 d ra rb); return d)
++
++/-- LEMMA patch 0001: `Nat.div x 0 = 0` (exact Lean semantics; no sBPF divide-by-zero trap). -/
++private def lowerNatDiv (a b : Val) : LowerM Val := do
++  let ra ← valToReg a
++  let rb ← valToReg b
++  let z ← emitConst 0
++  lowerSelect .eq rb z (emitConst 0) (do
++    let d ← freshVReg; emit (.binOp .div64 d ra rb); return d)
++
++/-- LEMMA patch 0001: `Nat.mod x 0 = x` (exact Lean semantics; no sBPF divide-by-zero trap). -/
++private def lowerNatMod (a b : Val) : LowerM Val := do
++  let ra ← valToReg a
++  let rb ← valToReg b
++  let z ← emitConst 0
++  lowerSelect .eq rb z (pure ra) (do
++    let d ← freshVReg; emit (.binOp .mod64 d ra rb); return d)
++
++/-- LEMMA patch 0001: `UIntN.ofNatTruncate n = min n (2^N - 1)` (clamp, not mask). -/
++private def lowerOfNatTruncate (v : Val) (maxV : UInt64) : LowerM Val := do
++  match v with
++  | .natLit n => return .reg (← emitConst (if n > maxV.toNat then maxV else n.toUInt64))
++  | _ =>
++    let r ← valToReg v
++    let m ← emitConst maxV
++    lowerSelect .ugt r m (pure m) (pure r)
++
+ /-- Lower a `LetValue.const` call if it is a recognized Lean primitive or LeanSVM hardware intrinsic.
+     Returns `some val` if handled, or `none` if it should be inlined as a user/library declaration. -/
+ private def tryLowerPrimitive (declName : Name) (vals : Array Val) : LowerM (Option Val) := do
+@@ -615,11 +738,20 @@ private def tryLowerPrimitive (declName : Name) (vals : Array Val) : LowerM (Opt
+   | ``UInt8.decLe | `UInt8.ble => some <$> lowerCmpScalar .ule (vals.getD 0 .erased) (vals.getD 1 .erased)
+ 
+   -- === Scalar Nat ops (for loop indices / small literals) ===
+-  | ``Nat.add => some <$> lowerBinScalar .add64 none (vals.getD 0 .erased) (vals.getD 1 .erased)
+-  | ``Nat.sub => some <$> lowerSaturatingSub (vals.getD 0 .erased) (vals.getD 1 .erased)
+-  | ``Nat.mul => some <$> lowerBinScalar .mul64 none (vals.getD 0 .erased) (vals.getD 1 .erased)
+-  | ``Nat.div => some <$> lowerDivModScalar .div64 (vals.getD 0 .erased) (vals.getD 1 .erased)
+-  | ``Nat.mod => some <$> lowerDivModScalar .mod64 (vals.getD 0 .erased) (vals.getD 1 .erased)
++  -- LEMMA patch 0001: exact-or-abort `Nat` semantics (upstream used wrapping 64-bit ops).
++  | ``Nat.add => some <$> lowerNatAdd (vals.getD 0 .erased) (vals.getD 1 .erased)
++  | ``Nat.sub => some <$> lowerNatSub (vals.getD 0 .erased) (vals.getD 1 .erased)
++  | ``Nat.mul => some <$> lowerNatMul (vals.getD 0 .erased) (vals.getD 1 .erased)
++  | ``Nat.div => some <$> lowerNatDiv (vals.getD 0 .erased) (vals.getD 1 .erased)
++  | ``Nat.mod => some <$> lowerNatMod (vals.getD 0 .erased) (vals.getD 1 .erased)
++  -- LEMMA patch 0001: `Nat.pow` only on compile-time literals (e.g. `UInt32.size = 2^32`),
++  -- folded exactly; the materialization check above rejects results `≥ 2^64`.
++  | ``Nat.pow =>
++    match vals.getD 0 .erased, vals.getD 1 .erased with
++    | .natLit b, .natLit e =>
++      if e ≤ 128 then return some (.natLit (b ^ e))
++      else throw s!"Nat.pow with exponent {e} > 128 is not supported (LEMMA patch 0001)"
++    | _, _ => throw "Nat.pow on runtime values is not supported (LEMMA patch 0001)"
+   | ``Nat.beq | ``Nat.decEq => some <$> lowerCmpScalar .eq  (vals.getD 0 .erased) (vals.getD 1 .erased)
+   | ``Nat.ble | ``Nat.decLe => some <$> lowerCmpScalar .ule (vals.getD 0 .erased) (vals.getD 1 .erased)
+   | ``Nat.blt | ``Nat.decLt => some <$> lowerCmpScalar .ult (vals.getD 0 .erased) (vals.getD 1 .erased)
+@@ -630,11 +762,16 @@ private def tryLowerPrimitive (declName : Name) (vals : Array Val) : LowerM (Opt
+   | ``UInt32.toUInt64 | ``UInt32.toNat
+   | ``UInt64.toNat | ``UInt64.toUSize | ``USize.toUInt64 =>
+     return some (vals.getD 0 .erased)
+-  | ``UInt64.ofNat | ``UInt64.ofNatTruncate =>
++  -- LEMMA patch 0001: `ofNatTruncate` clamps (upstream masked, which is wrong for big inputs).
++  | ``UInt64.ofNatTruncate => some <$> lowerOfNatTruncate (vals.getD 0 .erased) 0xFFFFFFFFFFFFFFFF
++  | ``UInt32.ofNatTruncate => some <$> lowerOfNatTruncate (vals.getD 0 .erased) 0xFFFFFFFF
++  | ``UInt16.ofNatTruncate => some <$> lowerOfNatTruncate (vals.getD 0 .erased) 0xFFFF
++  | ``UInt8.ofNatTruncate  => some <$> lowerOfNatTruncate (vals.getD 0 .erased) 0xFF
++  | ``UInt64.ofNat =>
+     match vals.getD 0 .erased with
+     | .natLit n => return some (.reg (← emitConst n.toUInt64))
+     | v => return some v
+-  | ``UInt32.ofNat | ``UInt32.ofNatTruncate | ``UInt64.toUInt32 =>
++  | ``UInt32.ofNat | ``UInt64.toUInt32 =>
+     match vals.getD 0 .erased with
+     | .natLit n => return some (.reg (← emitConst n.toUInt32.toUInt64))
+     | v =>
+@@ -642,7 +779,7 @@ private def tryLowerPrimitive (declName : Name) (vals : Array Val) : LowerM (Opt
+       let m ← emitConst 0xFFFFFFFF
+       let dst ← freshVReg; emit (.binOp .and64 dst r m)
+       return some (.reg dst)
+-  | ``UInt16.ofNat | ``UInt16.ofNatTruncate | ``UInt64.toUInt16 | ``UInt32.toUInt16 =>
++  | ``UInt16.ofNat | ``UInt64.toUInt16 | ``UInt32.toUInt16 =>
+     match vals.getD 0 .erased with
+     | .natLit n => return some (.reg (← emitConst n.toUInt16.toUInt64))
+     | v =>
+@@ -650,7 +787,7 @@ private def tryLowerPrimitive (declName : Name) (vals : Array Val) : LowerM (Opt
+       let m ← emitConst 0xFFFF
+       let dst ← freshVReg; emit (.binOp .and64 dst r m)
+       return some (.reg dst)
+-  | ``UInt8.ofNat | ``UInt8.ofNatTruncate | ``UInt64.toUInt8 | ``UInt32.toUInt8 | ``UInt16.toUInt8 =>
++  | ``UInt8.ofNat | ``UInt64.toUInt8 | ``UInt32.toUInt8 | ``UInt16.toUInt8 =>
+     match vals.getD 0 .erased with
+     | .natLit n => return some (.reg (← emitConst n.toUInt8.toUInt64))
+     | v =>
+@@ -1426,7 +1563,7 @@ partial def lowerCode
+       lowerSwitch tagReg #[] cs.alts envMap jpMap onReturn (fuel - 1) isDirectEntryRet
+ 
+     | .natLit n =>
+-      let r ← emitConst n.toUInt64
++      let r ← natLitToReg n
+       lowerSwitch r #[] cs.alts envMap jpMap onReturn (fuel - 1) isDirectEntryRet
+ 
+     | .erased =>

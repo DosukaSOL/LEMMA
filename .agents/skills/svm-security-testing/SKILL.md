@@ -3,9 +3,12 @@ name: svm-security-testing
 description: >-
   Security audit, formal proof, and LiteSVM adversarial testing guide for Solana
   programs built with lean-svm. Use whenever designing, reviewing, hardening, or
-  testing a lean-svm program to catch common SVM bugs (same-tx account revival,
-  dirty-buffer init, missing owner/size/discriminator checks, spoofed CPI programs,
-  SPL/lamport self-transfer aliasing, share-pool inflation, and proof-to-runtime gaps).
+  testing a lean-svm program to catch common SVM and real-world mainnet bugs
+  (same-tx account revival, dirty-buffer init, missing owner/size/discriminator
+  checks, spoofed CPI programs, SPL/lamport self-transfer aliasing, share-pool
+  inflation, K=4 adversarial leader censorship & compounding bounds, cross-market
+  stale-oracle DoS, Dutch-auction 1-atom dust-reset & batch clearing, Token-2022
+  TransferFee / wSOL burn traps, and proof-to-runtime / compiler gaps).
 ---
 
 # SVM Security Testing & Hardening Guide (`lean-svm`)
@@ -125,12 +128,11 @@ Two account arguments point to the same pubkey:
 - **SPL Token self-transfer (`source == dest`):** Passing `vault` as `destTok` on withdrawal makes SPL Token execute a **no-op** (vault SPL balance unchanged) while the program still decrements its internal `vaultBalance` (`internal < SPL`, permanently orphaning tokens and breaking exact stock conservation).
 - **Direct lamport self-transfer (`from == to`):** Reading both `fromBal` and `toBal` before writing (`setLamports from (bal - amt); setLamports to (bal + amt)`) overwrites the debit with `bal + amt` (or corrupts internal balances).
 - **Two-party state aliasing (`pflA == pflB`, `vaultA == vaultB`):** Reading both balances, mutating both, and writing back loses the first write or lets a user trade/liquidate against themselves.
+- **Solana ABI Duplicate-Account Markers (`dupMarker != 0xFF`):** When an instruction legitimately accepts two accounts that *may* share the same pubkey (e.g., `quoteTokProg` and `targetTokProg` both being `TOKEN_PROGRAM_ID`, or `quoteMint == targetMint`), Solana serializes the second occurrence as an **8-byte duplicate marker** (`byte 0 = original_index`, NOT `0xFF`). Calling `AccountView.keyPtr` / `dataPtr` directly on a duplicate `AccountView` reads garbage from the next account!
 
 **How to Prevent:**
-Explicitly require `!(← pubkeyEq (AccountView.keyPtr a) (AccountView.keyPtr b))` for every pair of accounts that must be distinct:
-- `userTok != vault`, `destTok != vault`, `liqTok != vault`
-- `fromAcc != toAcc` on direct lamport transfers
-- `partyA != partyB`, `vaultA != vaultB`, `acc != dest` on `CloseAccount`
+- Explicitly require `!(← pubkeyEq (AccountView.keyPtr a) (AccountView.keyPtr b))` for every pair of accounts that must be distinct (`userTok != vault`, `destTok != vault`, `liqTok != vault`, `from != to`, `partyA != partyB`, `acc != dest`), AND check `(← rawLoadU8 acc) == ABI.nonDupMarker` (`0xFF`) whenever an account must be non-duplicate.
+- Whenever a later account is *allowed* to alias a known earlier account at index `k` (like `targetTokProg == quoteTokProg`), check `let dup ← rawLoadU8 acc; if dup != ABI.nonDupMarker then require (dup == k)` and resolve to the original `AccountView` before reading its key/owner/data!
 
 **LiteSVM Test Recipe:**
 - Pass `vault` as `destTok` on every withdrawal / fee payout → assert error.
@@ -224,6 +226,137 @@ In multi-account / cross-margin protocols, allowing withdrawals, risk-increasing
 
 ---
 
+### 11. Real-World Solana Mainnet Threat Model: `K + 1 = 5` Leader Censorship & Post-Jump `liqFee` Compounding
+
+**The Bug:**
+- Assuming a 1-slot rate limit or 1-slot delay stops an adversarial validator. On Solana mainnet, a single leader is scheduled for **`K = 4` consecutive slots** (~1.6s). Moreover, a position that is healthy at slot `t` (`equity ≥ mm`) can cross below `mm` on **triggering slot `t + 1`** and then suffer **`K = 4` consecutive censored slots** (`t + 2 .. t + 5`), meaning **5 compounded oracle moves** (`p0 → p5`) can elapse before an honest leader liquidates at `p5`!
+- Using a linear `4 * maxMoveBps` or even `K = 4` approximation understates both true 5-step compounding `((10_000 + m)^5 - 10_000^5) / 10_000^4` AND the fact that `liqFee` is charged on **post-jump notional `q * p5`** (up to `p5 / p0 ≤ 1 + k5MoveBps / 10_000` larger for Shorts!), not `q * p0`.
+- Leaving `imBps - mmBps < maxMoveBps` allows a same-slot oracle update to push a freshly opened position straight past maintenance margin.
+
+**How to Prevent:**
+- Model the exact `K + 1 = 5` triggering + censored window AND post-jump `liqFee` at `p5` explicitly in your Lean `ThreatModel`.
+- Enforce the exact compounded `K + 1 = 5` envelope at market/pool creation (for `maxMoveBps ≤ 1500`):
+  - `k5MoveBps := 5 * maxMoveBps + (12 * maxMoveBps * maxMoveBps + 9999) / 10_000` (proven `≥` exact 5-step compounding!)
+  - `liqAtP5 := liqFeeBps + (liqFeeBps * k5MoveBps + 9999) / 10_000` (exact upper bound on `liqFee` at `p5`!)
+  - `k5MoveBps + liqAtP5 ≤ mmBps` AND `mmBps + maxMoveBps ≤ imBps`
+- Never rely on `T = 1`-slot delays for liveness or auction clearing; any anti-censorship window (e.g. batch auction epoch or wind-down staleness) must satisfy `windowSlots ≫ K = 4` (e.g. `≥ 32` slots minimum, `750–2250` slots / 5–15 min in production).
+
+**LiteSVM Test Recipe:**
+- Test exact boundary rejection (`m = 80, mm = 500, liqFee = 100` → `k5(80)+liqAtP5 = 513 > 500` rejected; `m = 75` → accepted).
+- Simulate `K + 1 = 5` consecutive adversarial oracle steps with liquidations censored until the honest slot, and assert `badDebt == 0` and `insDraw == 0`.
+
+---
+
+### 12. Permissionless Multi-Market Non-Contagion Firewall & Stale-Oracle DoS
+
+**The Bug:**
+- **Dual-Direction Cross-Market Contagion (`M_atk → I_BTC`):** If a permissionless cross-margin portfolio holds ALL collateral in a single shared `capital` pool with no per-leg firewall, an attacker can open an honest `BTC` leg (`mm = $50`) alongside a self-controlled permissionless `M_atk` leg in the SAME portfolio, pump `M_atk` (or trigger `M_atk` `liqFee` debits) to drain shared `capital → 0` right before `BTC` ticks down `-0.75%`, and then liquidate their own `BTC` leg with **`$0` backing** — stealing directly from honest `I_BTC` (and breaking the single-market `K + 1 = 5` solvency precondition `equity ≥ mm`)!
+- **Stale-oracle cross-margin DoS:** In a multi-market cross-margin portfolio, if `RefreshLeg` requires `checkOracleFresh`, any permissionless or abandoned market can halt its oracle to permanently freeze `Withdraw` and `Liquidate` on *every* user holding a leg in that market (even on healthy BTC/ETH legs!).
+- **Capital-shielding / partial-bankruptcy drain (Bug 1B / 1C):** Leaving `freeCapital > 0` or `leg[m].lockedMm > 0` when drawing `I_m`, OR allowing partial liquidation when `freeCapital == 0 && leg[m].lockedMm == 0` (leaving zombie bad debt).
+- **Asymmetric post-ADL rounding & sub-nanounit dust:** After partial ADL (`oiSide < rawSide`), using floored `Δk` on the losing side under-collects relative to winners (`∑ gain > ∑ loss`), and a `>10^9:1` wipeout can leave `oi > 0` with `adl == 0` (an unclosable zombie leg).
+- **Fronting / receivable NAV arbitrage:** When an insurance pool fronts USD to winners (`insFronted > 0`), pricing LP share mints on cash `ins` alone lets attackers mint cheap shares and capture incoming loser repayments.
+
+**How to Prevent:**
+- **Per-Leg `lockedMm` Firewall + Shared `freeCapital`:** Split portfolio equity into `freeCapital` (`PflOff.capital`) + per-leg `leg[i].lockedMm` (with cached sum `PflOff.totalLockedMm == ∑ leg[i].lockedMm`, `DexOff.totalCapital == ∑_P (P.freeCapital + P.totalLockedMm)`):
+  - **Loss & `liqFee` isolation:** Losses and liquidation fees on market `m` burn strictly `leg[m].posPnl → freeCapital → leg[m].lockedMm`, and are **FORBIDDEN** from touching `leg[j].lockedMm` for any `j ≠ m`.
+  - **Zero-sum immediate release:** When a leg shrinks or closes, `syncLegMargins` releases excess `lockedMm` immediately back to `freeCapital`; when a leg grows or mark price rises, `syncLegMargins` tops up `lockedMm` from `freeCapital`.
+  - **Per-leg liquidation health & Bug 1B/1C:** Market `m` health is `freeCapital + leg[m].lockedMm + posPnl ≥ leg[m].cachedMm`; insurance draw requires `shortfall > 0 && freeCapital == 0 && leg[m].lockedMm == 0`; full close is forced whenever `freeCapital == 0 && leg[m].lockedMm == 0`.
+  - **Permissionless cross-margin preserved:** Realized gains on any market credit `freeCapital` and immediately back other markets; excess collateral above `∑ leg[i].lockedMm` freely offsets cross-market losses!
+- **Stale-oracle non-blocking:** Do **not** call `checkOracleFresh` in `RefreshLeg` (a stale market has frozen `markPrice`, settles `ΔK = 0`, keeps its full `cachedMm`/`cachedIm`/`lockedMm`, and unblocks same-slot freshness on healthy legs).
+- **Post-ADL & Fronting:** Use ceiling `Δk` on the losing side vs floor `Δk` on the winning side, snap sub-nanounit dust OI (`adl' == 0`) cleanly to `0`, and price insurance LP mints on optimistic NAV (`ins + insFronted`) while bounding `maxFrontBps ≤ maxInsDrawBps`.
+
+**Formal Proof Pattern (Multi-Market Inductive Non-Contagion):**
+- Prove an inductive trace theorem over arbitrary `List AdvMarketOp` executed on adversarial markets `m_atk ≠ m_real` showing `leg[m_real].lockedMm` is **bit-for-bit invariant**, AND couple it with a `SvmState.mem` bytecode refinement proving `settleAndRefreshLeg` on `slotIdx` never mutates `legPtrAt fData j + LegOff.lockedMm` for any `j ≠ slotIdx`!
+
+**LiteSVM Test Recipe:**
+- Reproduce the exact `M_atk → I_BTC` contagion exploit: open Long `$1,000` honest BTC (`mm=$50`) + Short `$1,000` permissionless `M_atk` (`mm=$50`) in one portfolio; pump `M_atk +25%`, refresh + liquidate `M_atk` (draining `freeCapital → 0` and `M_atk.lockedMm → 0`, including `liqFee`); assert `BTC.lockedMm == $50` bit-for-bit intact; tick BTC down `-0.75%` and liquidate BTC; assert `shortfall == 0` and `I_BTC` draw == `0`!
+- Halt a permissionless market's oracle past `maxStaleness` and verify a user with legs in both the stale market and a healthy market can still refresh, withdraw excess margin, and be liquidated cleanly.
+
+---
+
+### 13. On-Chain Auctions, Buybacks & Fee-Capture Anti-MEV / Anti-Spam Rules
+
+**The Bug:**
+- **1-Atom Dust-Reset / Rate-Inflation DoS (Naive Dutch Auctions):** Allowing any partial fill (`quoteAmt = 1`, $0.000001) to reset `epochStartSlot` and double `startRate` lets an attacker permanently pin the auction at `MAX_RATE` for pennies — or snipe 1 atom at the floor to ratchet the next epoch down to `minRate`.
+- **Fixed Price-Floor Volatility Trap:** Immutable `minRate` permanently freezes funds if an external token pumps 100x, or drains value if the token dumps 100x.
+- **Spam / Unfunded / Cancellable Bid DoS:** Any `O(N)` loop over bidder accounts in settlement hits Solana's 200k CU / 1232 B tx limit; any cancellable bid enables last-slot spoofing; pure pro-rata (`B_virt = 0`) lets a 1-atom bidder steal 100% of a quiet/censored epoch.
+- **Extreme Dump `mulDiv64` Overflow DoS:** Computing `clearedRate = mulDiv64 B POS_SCALE Q` on settlement without pre-checking `B / Q >= 4 * (MAX_RATE_E6 / POS_SCALE)` overflows `UInt64` on a 1,000,000x token dump and bricks settlement!
+
+**How to Prevent (Gavel-Style `xy = k` Virtual-Reserve X-Minute Uniform-Price Batch):**
+- Separate **disjoint accounting buckets** (e.g. `DexOff.totalRewards` disjoint from `totalSurplus`, `totalInsurance`, `totalCapital`) so protocol admin sweeps can never touch per-market reward pools.
+- Use fixed-duration epochs (`epochSlots ≥ MIN_EPOCH_SLOTS ≫ K = 4`), **irrevocable** AMM-style unlimited bids (`O(1)` per bid, `O(1)` settlement, `O(1)` claim across overlapping `EpochState` accounts), and uniform `xy = k` virtual-reserve clearing:
+  - `quotePaid = floor(Q * B / (B + B_virt))`, `rollover = Q - quotePaid`, `payout_i = floor(Q * b_i / (B + B_virt))`.
+  - Prove `∑ payout_i ≤ quotePaid ≤ Q` (guaranteed 100% claimable for unlimited bidders), `payout_i * B_virt ≤ Q * b_i` (1-atom quiet-epoch cap), and once-per-epoch self-calibrating `reserveRateE6` (halves on underfill → zero 1000x-pump freeze; clamps `B / Q` before `mulDiv64` → zero overflow DoS).
+
+**LiteSVM Test Recipe:**
+- Submit multiple bids from the same bidder (same receipt) + 5+ 1-atom dust spam bids across separate receipts; verify `SettleEpoch` is O(1) CU, honest bidders get the exact same uniform price, and 1-atom spammers receive `0` quote.
+- Simulate a quiet/censored epoch with ONLY a 1-atom attacker bid; assert `quotePaid == 0`, 100% of `Q` rolls over intact into Epoch 2, and `reserveRateE6` halves.
+
+---
+
+### 14. External Token-2022 Extensions (`TransferFee`, `FreezeAuthority`) & `wSOL` NativeMint Burn
+
+**The Bug:**
+- **SPL `Burn` rejects `wSOL` (`So11111111111111111111111111111111111111112`)** with `NativeNotSupported`.
+- **Token-2022 `TransferFee` inflation:** Crediting instruction `amount` instead of actual tokens arriving in the escrow causes later burns/withdrawals of `totalCredited` to revert with `InsufficientFunds` (permanent DoS or insolvency).
+- **Mint `FreezeAuthority`:** A malicious or untrusted mint's freeze authority can freeze the program's vault/escrow, permanently DoS-ing all users.
+
+**How to Prevent:**
+- Support BOTH `burnMode = 0` (real SPL Token / Token-2022 `Burn` reducing `mint.supply`) AND `burnMode = 1` (transfer into a PDA-owned permanent dead-sink account with **zero** withdraw instruction) for `wSOL`.
+- On every inbound transfer of an arbitrary external SPL / Token-2022 token, measure the **exact balance delta** (`received = postBal - preBal`) on the escrow account and credit strictly `received`.
+- For core base-collateral vaults, forbid `freeze_authority != None` by default (with an explicit immutable opt-in `allowFreeze` flag for blessed issuer mints like USDC/USDT).
+
+**LiteSVM Test Recipe:**
+- Test real SPL Token, real **Token-2022**, AND real **wSOL** (`is_native = Some(rent)`) end-to-end in LiteSVM, verifying `mint.supply` decreases for SPL/Token-2022 and dead-sink balance increases for wSOL.
+
+---
+
+### 15. Compiler, Byte-Layout & Proof-to-Runtime Gap Discipline (`lean-svm`)
+
+**The Bug:**
+- Pure `Nat` proofs do not catch `UInt64` wraparound, ABI byte-offset typos, or sBPF codegen bugs (such as register-reuse clobbering when a binary instruction's destination aliases its RHS operand in lowering/regalloc).
+- **Silent Trailing-Byte Truncation / Readonly `AccountDataTooSmall` (Agave Direct Mapping):** If a struct's `size` is accidentally smaller than `lastField + fieldWidth` (e.g. a 32-byte `Pubkey` at offset `368` with `size = 392` instead of `400`), writes to a **writable** account silently spill into Solana's 10KB realloc padding and get **silently truncated to zero** during serialization, while any **readonly** reader that reaches the trailing bytes faults with `InstructionError::AccountDataTooSmall` inside Agave's direct-mapping VM!
+
+**How to Prevent:**
+- Always add a compile-time `by decide` theorem in your `Layout` module proving `lastField + fieldWidth ≤ size ∧ size % 8 == 0` for every account struct — making off-by-N layout truncation impossible at compile time.
+- **Spec↔Program Non-Drift Rule:** Never leave single-market or idealized assumptions in `Spec.lean` / `ThreatModel.lean` that are violated by multi-market or cross-instruction interactions in `Program.lean`. Every precondition of an economic theorem (e.g., `equity ≥ mm` before a `K+1`-slot window, or `virtBids ∈ [1, MAX_VIRT_BIDS]`) must be **inductively preserved across ALL instructions** (including adversarial markets, liquidation fees, and hand-off modes) and coupled directly to `Refinement.lean` on `SvmState.mem`.
+- **Manual `nextCursor` `ABI.nonDupMarker` Rule:** Whenever parsing accounts manually via `nextCursor` (instead of a helper that already checks `0xFF`), ALWAYS verify `(← rawLoadU8 acc) == ABI.nonDupMarker` — or, where legitimate self-aliasing is supported (e.g., rotating `oracleAuth` back to `marketAdmin` via `[mkt, admin, admin]`), explicitly resolve `dupIdx == 1` to the original `AccountView` before reading its pubkey!
+- Follow **Proof-Driven Development (PDD)**: whenever auditing a new feature or closing a bug, first state the adversarial threat model + prove the exact failure/extraction bound, fix the implementation, prove the `SvmState.mem` bytecode refinement, and execute the exact adversarial exploit in LiteSVM against the compiled `.so` ELF.
+- Whenever modifying `lean-svm` lowering/regalloc/peephole passes, immediately run ALL verified example ELFs + downstream LiteSVM adversarial & fuzz suites.
+
+---
+
+### 16. Adversarial External PropAMM / Matcher CPI-Out & HLP Vault Containment (0 Signer Delegation)
+
+**The Bug:**
+- **CPI-In signer delegation:** Having a taker call an untrusted third-party matcher which CPIs into core with `takerOwner (S)` delegates the taker's top-level signer authority to closed-source code (enabling SOL/SPL drains or spoofed trades).
+- **Unwhitelisted Permissionless Market Drain (`M_scam` via `matcher.so`):** If a passive PropAMM quotes ANY `marketId` forwarded by a taker without checking an immutable `allowedMarkets` allowlist, an anonymous attacker can create a permissionless `M_scam` with an attacker-controlled oracle, open a large trade against an LP/HLP portfolio via `TradeWithMatcher`, pump `M_scam`, and drain 100% of the LP/HLP vault's `freeCapital`!
+- **HLP Strategist Rug (`SetHlpMatcher` / `HlpTakeoverLiquidate`):** Even if an HLP vault forbids strategist withdrawals, a rogue strategist who can bind an arbitrary `evil_matcher.so` context (or a PropAMM quoting `M_scam`, or `HlpTakeoverLiquidate` on `M_scam`) can still drain 100% of LP deposits through bad fills or scam-market takeovers!
+- **`noop.so` / stale-buffer quote replay:** Reading a quote struct written by an external matcher without a monotonic nonce lets a no-op program replay a stale quote forever.
+- **Unbounded fill / abusive pricing / self-CPI / re-entrancy / fee-bypass hand-off:** Passing core state accounts or skipping core-side `fillQty ≤ maxQty`, `limitPrice`, `maxMoveBps`, or `matcherProg != progId` checks lets a malicious matcher over-fill, manipulate price, or re-enter core. Omitting `tradeFeeBps` on `mode = 2/3` hand-offs lets traders evade trading fees whenever transferring positions to a new counterparty.
+
+**How to Prevent:**
+- Use **0-signer CPI-Out** from core to `matcherProg`: verify `takerOwner (S)` in core ONLY, NEVER pass `takerOwner` or core writable accounts to `matcherProg` — pass strictly `[matcherCtx (W, S=0)]` (+ optional readonly non-signer `extraAcc`, ALWAYS requiring `rawLoadU8 extraAcc == ABI.nonDupMarker` so passing a core/signer account as `extraAcc` can never cause an 8-byte dup-stub memory overread!).
+- **Immutable PropAMM Market Allowlist:** Pin `allowedCount ∈ [1..8]` + `allowedMarkets[8]` in `PropCtx` at `InitPropAmm` (immutable — `UpdatePropAmm` can never modify it) and reject any unlisted `marketId` on every batch leg (`MErr.marketNotAllowed`).
+- **Immutable HLP Vault Strategist Constraints:** Pin `allowedMatcherProg` + `allowedMarkets[8]` on `HlpVault` at `InitHlpVault`. Enforce in `SetHlpMatcher` that `mc.owner == allowedMatcherProg ∧ magic == MAGIC_MRET ∧ mc.allowedMarkets ⊆ HlpVault.allowedMarkets`, and enforce in `HlpTakeoverLiquidate` that `mkt.marketId ∈ HlpVault.allowedMarkets`.
+- Bind `lpPfl.matcherCtx` on the LP's portfolio so the LP retains 100% EOA custody (can revoke or withdraw directly at any time) and require `matcherCtx.owner == matcherProg`, `isExecutable matcherProg`, and `matcherProg != progId`.
+- Pass `reqSeq = preSeq + 1` in the CPI request (wrapping `UInt64` add satisfies `preSeq + 1 ≠ preSeq` unconditionally!) and require `magic == MAGIC_MRET ∧ status == 0 ∧ seq == reqSeq` post-CPI.
+- Support unified multi-market batching (`k ∈ [1..8]` distinct markets with `dupMarker == 0xFF` & distinct `marketId` checks) in ONE CPI so market makers see all offers atomically without tx introspection, while core enforces `0 < fillQty_i ≤ maxQty_i`, taker `limitPrice_i`, `maxMoveBps`, `tradeFeeBps` on `mode = 0/2/3`, and atomic rollback across all `k` legs.
+- **Universal economic buy/sell spread direction across open & reduce:** Never key spread/limit direction on raw `takerIsLong` when closing (`mode = 1`): closing an existing Long is a **SELL** (receives Bid `≤ markP`, floored by `≥ limitPrice`), and closing an existing Short is a **BUY** (pays Ask `≥ markP`, capped by `≤ limitPrice`). Compute `takerIsBuying = (mode == 0 && takerIsLong) || (mode == 1 && !takerIsLong)` in both core limit checks and matchers, and swap `applyExecSpread` arguments on `mode = 1` so third-party PropAMMs using standard Bid/Ask quotes never invert spread payments on reduces.
+- **Overflow-free ceiling virtual reserves & auto-closed receipts:** In virtual-reserve batch auctions (`xy = k`), compute `virtBids` via overflow-free capping (`computeVirtBidsU64` yielding `virtBids ∈ [1, MAX_VIRT_BIDS]`, never overflowing `UInt64` when `resRate == MAX_RATE_E6` and `totalPot` is large, and never rounding to `0` on tiny pots!). In one-shot claim handlers (`ClaimQuote`), auto-close the per-bid receipt (`zeroWords` + `MAGIC_CLOSED` + refund lamports to `bidder (W, S)` with `bidReceipt != bidder` aliasing check) to prevent permanent per-bid rent leaks with zero extra opcodes.
+
+**LiteSVM Test Recipe:**
+- Compile a real adversarial `evil_matcher.so` attacking all vectors (over-fill, abusive `limitPrice`, nonzero `status`, stale `seq` / `noop.so`, bad magic, zero fill, exceeding `maxMoveBps`, writing readonly `extraAcc`, aliased duplicate market in batch, self-CPI) AND verify:
+  - Anonymous `TradeWithMatcher` on an unlisted `M_scam` → rejected (`Custom(201)`).
+  - HLP strategist binding `evil_matcher.so` ctx → rejected (`Custom(507)`).
+  - HLP strategist binding honest PropAMM ctx whose allowlist includes `M_scam` → rejected (`Custom(508)`).
+  - HLP strategist calling `HlpTakeoverLiquidate` on unlisted `M_scam` → rejected (`Custom(508)`).
+  - `mode = 2/3` hand-offs charge exact `tradeFeeBps` on the incoming opening buyer.
+  - `UpdateMarketAuth` self-rotation `[mkt, admin, admin]` cleanly resolves dup index `1` without corrupting keys.
+- Verify small-pot `virtBids == 1` (`totalPot * resRate < 1e6`) blocks 100% drain by a 1-atom bidder, and verify `ClaimQuote` refunds 100% of receipt rent lamports to `bidder` while blocking double-claim / same-tx revival.
+
+---
+
 ## Pre-Deployment Verification Checklist
 
 Before deploying any `lean-svm` program to devnet or mainnet:
@@ -235,10 +368,15 @@ Before deploying any `lean-svm` program to devnet or mainnet:
    - `owner == progId` on all program state accounts
    - Exact `dataLen == exactSize`
    - Type magic check (`!= 0`, `!= MAGIC_CLOSED`)
-   - Distinct-key checks (`!=`) for all aliasable pairs (`dest != vault`, `from != to`, `partyA != partyB`)
+   - Distinct-key checks (`!=`) for all aliasable pairs (`dest != vault`, `from != to`, `partyA != partyB`, `escrow != sink`)
    - Canonical CPI program ID pinning (`checkTokenProg` / `checkTokenOr2022Prog` / `checkSystemProg`)
+   - Balance-delta accounting (`postBal - preBal`) on arbitrary external SPL/Token-2022 deposits
 3. **Audit every init & close path:**
    - Full `zeroWords` on fresh init AND close
    - Permanent nonzero `MAGIC_CLOSED` tombstone on close
    - Verified with a `SvmState.mem` theorem (not just a `Nat` model!)
-4. **Run adversarial LiteSVM tests** covering every applicable item (#1–#10 above), plus a multi-step stateful invariant fuzzer against real SPL Token / Token-2022 accounts (zero vault mocks).
+4. **Audit real-world Solana mainnet threat model:**
+   - `K = 4` consecutive adversarial leader slots & exact compounded move envelopes
+   - Cross-market / multi-account isolation (unrelated adversarial market cannot steal funds or stale-oracle DoS healthy markets)
+   - Anti-MEV / anti-spam batch clearing (`O(1)` settlement, irrevocable bids, virtual-reserve quiet-epoch cap, overflow-free self-calibration)
+5. **Run adversarial LiteSVM tests** covering every applicable item (#1–#15 above), plus a multi-step stateful invariant fuzzer against real SPL Token / Token-2022 / wSOL accounts (zero vault mocks).

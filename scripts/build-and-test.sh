@@ -14,6 +14,7 @@ lake exe lean-svm build Examples.Amm          Examples.Amm.entrypoint          -
 lake exe lean-svm build Examples.Lending      Examples.Lending.entrypoint      -o build/lending.so
 lake exe lean-svm build Examples.DutchAuction Examples.DutchAuction.entrypoint -o build/dutch_auction.so
 lake exe lean-svm build Examples.BondingCurve Examples.BondingCurve.entrypoint -o build/bonding_curve.so
+lake exe lean-svm build Examples.CompilerRegression Examples.CompilerRegression.entrypoint -o build/compiler_regression.so
 
 echo "=== 3. Compile hand-rolled #![no_std] Rust baselines (if Solana platform-tools installed) ==="
 SOLANA_TOOLS="${SOLANA_TOOLS:-$HOME/.cache/solana/v1.58/platform-tools}"
@@ -31,5 +32,5 @@ if [ -x "$SOLANA_TOOLS/rust/bin/rustc" ]; then
   done
 fi
 
-echo "=== 4. Execute all programs & benchmarks on real LiteSVM (Agave 3.1.3) ==="
+echo "=== 4. Execute all sBPF v3 programs & benchmarks on real LiteSVM 0.18 (Agave 4.x) ==="
 cargo run --manifest-path svm-runner/Cargo.toml --release

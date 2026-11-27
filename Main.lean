@@ -1,8 +1,8 @@
 /-
-  Main.lean — `lean-svm` Native Lean 4 → Solana sBPF Compiler CLI
+  Main.lean — `lean-svm` Native Lean 4 → Solana sBPF v3 Compiler CLI
 
   Usage:
-    lake exe lean-svm build <Module> <DeclName> -o <out.so> [--sbpf v0|v3] [--dump-ir] [--dump-asm]
+    lake exe lean-svm build <Module> <DeclName> -o <out.so> [--dump-ir] [--dump-asm]
 -/
 import Lean
 import LeanSVM
@@ -12,14 +12,13 @@ open LeanSVM.Compiler
 open LeanSVM.SBPF
 
 private def usage : String :=
-  "lean-svm: Native Lean 4 → Solana sBPF Optimizing Compiler\n\n" ++
+  "lean-svm: Native Lean 4 → Solana sBPF v3 Optimizing Compiler\n\n" ++
   "Usage:\n" ++
   "  lean-svm build <ModuleName> <EntrypointDecl> -o <output.so> [options]\n\n" ++
   "Options:\n" ++
-  "  -o <path>         Output Solana ELF64 .so file path (required)\n" ++
-  "  --sbpf v0|v3      Target Solana sBPF ISA version (default: v0)\n" ++
+  "  -o <path>         Output Solana sBPF v3 ELF64 .so file path (required)\n" ++
   "  --dump-ir         Print raw and optimized SbfIR to stdout\n" ++
-  "  --dump-asm        Print generated sBPF assembly to stdout\n" ++
+  "  --dump-asm        Print generated sBPF v3 assembly to stdout\n" ++
   "  -h, --help        Show this help message\n\n" ++
   "Example:\n" ++
   "  lake exe lean-svm build Examples.Counter Examples.Counter.entrypoint -o build/counter.so --dump-asm\n"
@@ -34,7 +33,6 @@ def main (args : List String) : IO UInt32 := do
     return 0
   | "build" :: modStr :: declStr :: rest =>
     let mut outPath? : Option System.FilePath := none
-    let mut sbpfVer : Version := .v0
     let mut dumpIR := false
     let mut dumpAsm := false
     let mut cur := rest
@@ -43,15 +41,6 @@ def main (args : List String) : IO UInt32 := do
       | "-o" :: p :: tail =>
         outPath? := some ⟨p⟩
         cur := tail
-      | "--sbpf" :: "v0" :: tail =>
-        sbpfVer := .v0
-        cur := tail
-      | "--sbpf" :: "v3" :: tail =>
-        sbpfVer := .v3
-        cur := tail
-      | "--sbpf" :: other :: _ =>
-        IO.eprintln s!"error: unsupported --sbpf version '{other}' (expected 'v0' or 'v3')"
-        return 1
       | "--dump-ir" :: tail =>
         dumpIR := true
         cur := tail
@@ -82,7 +71,7 @@ def main (args : List String) : IO UInt32 := do
       IO.eprintln "hint: run `lake build` first so the module .olean is up to date"
       return 1
 
-    let opts : CompileOptions := { sbpfVersion := sbpfVer, dumpIR, dumpAsm }
+    let opts : CompileOptions := { dumpIR, dumpAsm }
     match compileEntrypoint env declName opts with
     | .error err =>
       IO.eprintln s!"compile error ({declStr}): {err}"

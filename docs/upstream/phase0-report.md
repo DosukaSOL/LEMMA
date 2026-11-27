@@ -1,5 +1,9 @@
 # Phase 0: reconnaissance of upstream lean-svm
 
+> Historical record of the fork point `d49665e`. Upstream has since moved to sBPF v3, LiteSVM
+> 0.18.2 and real `sol_sha256`/`sol_invoke_signed_c` models, and has fixed part of the `Nat`
+> issue. LEMMA merges upstream regularly; current status is in the README and `patches/`.
+
 **Upstream:** `aeyakovenko/lean-svm` at `d49665eac029d0a53a8f8fc324d840df6e9649d5` (the only
 commit at the time). **Toolchain:** `leanprover/lean4:v4.36.0`. Everything below was checked by
 running it, not taken from the upstream README.

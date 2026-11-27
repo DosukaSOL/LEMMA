@@ -7,6 +7,15 @@
 | **Severity** | Soundness: compiled code could disagree with the Lean definitions that proofs are about |
 | **Effect on upstream examples** | None: all 8 example `.so` files are byte-identical before and after |
 
+> **Update (upstream `587ab09`, sBPF v3).** Upstream has since fixed `Nat.sub` (saturating) and
+> `Nat.div`/`Nat.mod` by zero on its own. It still lowers `Nat.add`/`Nat.mul` as wrapping
+> operations, still truncates `Nat` literals ≥ 2^64, and still reduces literal divisors mod 2^64
+> (so `x / (2^64+1)` would compile as `x / 1`). Against current upstream, LEMMA's test suite
+> still finds **1,011 failures** without this patch and **0** with it. After merging, LEMMA keeps its
+> own proven `Nat` lowering for all five operations. The live diff against upstream is
+> [`current-vs-upstream.diff`](current-vs-upstream.diff); the diff below is against the original
+> fork point.
+
 ## The bug
 
 Upstream lowered `Nat` arithmetic to **wrapping 64-bit** sBPF instructions and truncated `Nat`

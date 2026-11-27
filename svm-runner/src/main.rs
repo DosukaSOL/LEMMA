@@ -16,12 +16,38 @@ const SPL_TOKEN_ID: Address = address!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ
 const SPL_TOKEN_2022_ID: Address = address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
 
+/// Enforce strict shipping sBPF v3 ELF64 header invariants (SIMD-0178 + SIMD-0189 + SIMD-0377 + SIMD-0500):
+/// `e_machine == EM_BPF (247)`, `e_entry == 0x100000000`, `e_flags == 3 (SBPFVersion::V3)`,
+/// `e_phnum ∈ 1..=2`, and every PHDR is `PT_LOAD (1)` (zero `PT_DYNAMIC`, zero relocations).
+fn assert_sbpf_v3_elf(name: &str, elf: &[u8]) {
+    assert!(elf.len() >= 64, "{name}: ELF truncated (< 64 bytes)");
+    assert_eq!(&elf[0..4], b"\x7fELF", "{name}: bad ELF magic");
+    assert_eq!(elf[4], 2, "{name}: must be ELFCLASS64");
+    assert_eq!(elf[5], 1, "{name}: must be ELFDATA2LSB");
+    assert_eq!(u16::from_le_bytes(elf[16..18].try_into().unwrap()), 3, "{name}: must be ET_DYN");
+    assert_eq!(u16::from_le_bytes(elf[18..20].try_into().unwrap()), 247, "{name}: must be EM_BPF (247)");
+    assert_eq!(u64::from_le_bytes(elf[24..32].try_into().unwrap()), 0x1_0000_0000, "{name}: e_entry must be MM_BYTECODE_START (0x100000000)");
+    assert_eq!(u64::from_le_bytes(elf[32..40].try_into().unwrap()), 64, "{name}: e_phoff must be 64");
+    assert_eq!(u32::from_le_bytes(elf[48..52].try_into().unwrap()), 3, "{name}: e_flags must be 3 (SBPFVersion::V3 / SIMD-0500)");
+    let phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap()) as usize;
+    assert!((1..=2).contains(&phnum), "{name}: strict sBPF v3 must have 1 or 2 PHDRs, got {phnum}");
+    for i in 0..phnum {
+        let off = 64 + i * 56;
+        let p_type = u32::from_le_bytes(elf[off..off + 4].try_into().unwrap());
+        assert_eq!(p_type, 1, "{name}: PHDR[{i}] must be PT_LOAD (1), got {p_type} (no PT_DYNAMIC allowed)");
+    }
+}
+
 fn load_so(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("build")
         .join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    if !name.starts_with("rust/") {
+        assert_sbpf_v3_elf(name, &bytes);
+    }
+    bytes
 }
 
 fn send_ix(
@@ -259,8 +285,31 @@ fn test_hashcheck() {
     let expected: [u8; 32] = Sha256::digest(payload).into();
     assert_eq!(&acc_data[0..32], &expected[..]);
     assert_eq!(u64::from_le_bytes(acc_data[32..40].try_into().unwrap()), 123_456_789);
+
+    // Differential check against LeanSVM.Sha256 kernel-checked FIPS 180-4 NIST vectors ("", "abc", 56B two-block)
+    let nist_vectors: &[(&[u8], [u8; 32])] = &[
+        (b"", [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        ]),
+        (b"abc", [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+        ]),
+        (b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", [
+            0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8, 0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+            0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67, 0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+        ]),
+    ];
+    for (msg, want) in nist_vectors {
+        send_ix(&mut svm, &payer, &[], Instruction {
+            program_id, accounts: vec![AccountMeta::new(state_addr, false)], data: msg.to_vec(),
+        }).expect("hashcheck NIST vector failed");
+        let got = &svm.get_account(&state_addr).unwrap().data[0..32];
+        assert_eq!(got, &want[..], "sol_sha256 NIST vector mismatch for len={}", msg.len());
+    }
     println!(
-        "[PASS] HashCheck    | .so = {:>6} B | CUs = {:>5} (sha256 + clock + log)",
+        "[PASS] HashCheck    | .so = {:>6} B | CUs = {:>5} (sha256 + 3x NIST vectors + clock + log)",
         so.len(), meta.compute_units_consumed
     );
 }
@@ -912,6 +961,144 @@ fn test_security_regressions() {
     println!("[PASS] Security     | Dirty-init zeroing, owner pinning, exact-size, self-transfer & noop.so CPI guards verified!");
 }
 
+fn test_compiler_optimizations() {
+    let so = load_so("compiler_regression.so");
+    // Verify constant-length `sol_memset_` calls were fully expanded inline (zero dynamic relocation!)
+    assert!(
+        !so.windows(b"sol_memset_".len()).any(|w| w == b"sol_memset_"),
+        "compiler_regression.so must expand all <=40B memsets inline with 0 sol_memset_ relocs"
+    );
+
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    let out_addr = Address::new_unique();
+    let program_id = Address::new_unique();
+    svm.add_program(program_id, &so).unwrap();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+
+    // Pre-fill account with 0x55 so we verify both written bytes AND untouched sentinel bytes [124..128]
+    svm.set_account(out_addr, Account {
+        lamports: 1_000_000,
+        data: vec![0x55u8; 224],
+        owner: program_id,
+        ..Default::default()
+    }).unwrap();
+    let mut clk = svm.get_sysvar::<Clock>();
+    clk.slot = 111_222;
+    clk.epoch_start_timestamp = 1_700_000_000;
+    clk.epoch = 42;
+    clk.leader_schedule_epoch = 43;
+    clk.unix_timestamp = 1_700_000_999;
+    svm.set_sysvar::<Clock>(&clk);
+
+    // Bit-31 sign-extension edge cases + total Nat.sub / div0 / mod0 / shift32 masking:
+    //   add32: 0x7FFF_FFFF + 1        = 0x0000_0000_8000_0000
+    //   sub32: 0 - 1                  = 0x0000_0000_FFFF_FFFF
+    //   mul32: 0x0001_0000 * 0x8000   = 0x0000_0000_8000_0000
+    //   u8 range: 200 + 150 + (200 & 0xFF) = 550
+    //   Nat.sub: (0 : Nat) - 1 = 0 (saturates, does not wrap!)
+    //   UInt64/UInt32 div/mod by 0: 1000 / 0 = 0, 1000 % 0 = 1000 (total, never traps!)
+    //   UInt32 shift32 by 33: 3 <<< (33 % 32) = 6 (passes Agave verifier!)
+    let mut ix_data = Vec::with_capacity(42);
+    ix_data.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+    ix_data.extend_from_slice(&1u32.to_le_bytes());
+    ix_data.extend_from_slice(&0u32.to_le_bytes());
+    ix_data.extend_from_slice(&1u32.to_le_bytes());
+    ix_data.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+    ix_data.extend_from_slice(&0x0000_8000u32.to_le_bytes());
+    ix_data.push(200u8);
+    ix_data.push(150u8);
+    ix_data.extend_from_slice(&0u64.to_le_bytes()); // natSeed = 0 -> Nat.sub = 0
+    ix_data.extend_from_slice(&0u64.to_le_bytes()); // div64In = 0 -> div/mod by 0!
+
+    let meta = send_ix(&mut svm, &payer, &[], Instruction {
+        program_id,
+        accounts: vec![AccountMeta::new(out_addr, false)],
+        data: ix_data,
+    }).expect("compiler_regression failed");
+
+    let d = &svm.get_account(&out_addr).unwrap().data;
+    assert_eq!(u64::from_le_bytes(d[0..8].try_into().unwrap()), 0x0000_0000_8000_0000, "add32 bit-31 sign-ext bug!");
+    assert_eq!(u64::from_le_bytes(d[8..16].try_into().unwrap()), 0x0000_0000_FFFF_FFFF, "sub32 bit-31 sign-ext bug!");
+    assert_eq!(u64::from_le_bytes(d[16..24].try_into().unwrap()), 0x0000_0000_8000_0000, "mul32 bit-31 sign-ext bug!");
+    assert_eq!(u64::from_le_bytes(d[24..32].try_into().unwrap()), 550, "VRange promoted add/mask mismatch!");
+    assert_eq!(u64::from_le_bytes(d[32..40].try_into().unwrap()), 0, "Nat.sub(0, 1) must saturate to 0!");
+    assert_eq!(u64::from_le_bytes(d[40..48].try_into().unwrap()), 1000, "UInt64 1000/0 ^ 1000%0 must equal 1000!");
+    assert_eq!(u64::from_le_bytes(d[48..56].try_into().unwrap()), 1000, "UInt32 1000/0 ^ 1000%0 must equal 1000!");
+    assert_eq!(u64::from_le_bytes(d[56..64].try_into().unwrap()), 6, "UInt32 3 <<< 33 must mask shift to 1 -> 6!");
+    assert!(d[64..72].iter().all(|&b| b == 0x00), "inline memset 40B x 0x00 tail mismatch!");
+    assert!(d[72..104].iter().all(|&b| b == 0xFF), "inline memset 32B x 0xFF mismatch!");
+    assert!(d[104..124].iter().all(|&b| b == 0xAB), "inline memset 20B x 0xAB mismatch!");
+    assert!(d[124..128].iter().all(|&b| b == 0x55), "inline memset overwrote sentinel bytes!");
+    // 5. Positive LiteSVM checks matching Runtime.lean syscall models (sol_memcmp_ + 40B Clock):
+    assert_eq!(u64::from_le_bytes(d[128..136].try_into().unwrap()), 0, "sol_memcmp_ equal 32B must return 0");
+    assert_eq!(u64::from_le_bytes(d[136..144].try_into().unwrap()), 0xFFFF_FFFD, "sol_memcmp_ byte 31 (5 - 8) must return -3i32 as u32");
+    assert_eq!(u64::from_le_bytes(d[144..152].try_into().unwrap()), 111_222, "Clock.slot mismatch");
+    assert_eq!(u64::from_le_bytes(d[152..160].try_into().unwrap()), 1_700_000_000, "Clock.epoch_start_timestamp mismatch");
+    assert_eq!(u64::from_le_bytes(d[160..168].try_into().unwrap()), 42, "Clock.epoch mismatch");
+    assert_eq!(u64::from_le_bytes(d[168..176].try_into().unwrap()), 43, "Clock.leader_schedule_epoch mismatch");
+    assert_eq!(u64::from_le_bytes(d[176..184].try_into().unwrap()), 1_700_000_999, "Clock.unix_timestamp mismatch");
+    // 6. Multi-slice sol_sha256(["ab", "c"]) must match LeanSVM.Sha256.nist_abc across all 32 bytes!
+    let nist_abc: [u8; 32] = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    ];
+    assert_eq!(&d[184..216], &nist_abc[..], "multi-slice sol_sha256([\"ab\", \"c\"]) 32B digest mismatch!");
+    assert!(meta.compute_units_consumed < 550, "expected inline memsets + scalar guards + syscalls < 550 CUs, got {}", meta.compute_units_consumed);
+
+    // Also test positive non-zero Nat.sub (5 - 1 = 4) and positive non-zero div/mod (1000 / 7 = 142, 1000 % 7 = 6, 142 ^ 6 = 136)
+    let mut ix_pos = Vec::with_capacity(42);
+    ix_pos.extend_from_slice(&10u32.to_le_bytes());
+    ix_pos.extend_from_slice(&20u32.to_le_bytes());
+    ix_pos.extend_from_slice(&50u32.to_le_bytes());
+    ix_pos.extend_from_slice(&8u32.to_le_bytes());
+    ix_pos.extend_from_slice(&6u32.to_le_bytes());
+    ix_pos.extend_from_slice(&7u32.to_le_bytes());
+    ix_pos.push(10u8);
+    ix_pos.push(20u8);
+    ix_pos.extend_from_slice(&5u64.to_le_bytes());
+    ix_pos.extend_from_slice(&7u64.to_le_bytes());
+    send_ix(&mut svm, &payer, &[], Instruction {
+        program_id,
+        accounts: vec![AccountMeta::new(out_addr, false)],
+        data: ix_pos,
+    }).expect("compiler_regression positive scalar case failed");
+    let dp = &svm.get_account(&out_addr).unwrap().data;
+    assert_eq!(u64::from_le_bytes(dp[0..8].try_into().unwrap()), 30);
+    assert_eq!(u64::from_le_bytes(dp[8..16].try_into().unwrap()), 42);
+    assert_eq!(u64::from_le_bytes(dp[16..24].try_into().unwrap()), 42);
+    assert_eq!(u64::from_le_bytes(dp[32..40].try_into().unwrap()), 4, "Nat.sub(5, 1) = 4");
+    assert_eq!(u64::from_le_bytes(dp[40..48].try_into().unwrap()), 142 ^ 6, "UInt64 1000/7 ^ 1000%7");
+    assert_eq!(u64::from_le_bytes(dp[48..56].try_into().unwrap()), 142 ^ 6, "UInt32 1000/7 ^ 1000%7");
+
+    // And test UInt32 divisor = 0x1_0000_0000 (low 32 bits == 0, high 32 bits != 0 -> UInt32 div/mod by 0!)
+    let mut ix_data2 = Vec::with_capacity(42);
+    ix_data2.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+    ix_data2.extend_from_slice(&1u32.to_le_bytes());
+    ix_data2.extend_from_slice(&0u32.to_le_bytes());
+    ix_data2.extend_from_slice(&1u32.to_le_bytes());
+    ix_data2.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+    ix_data2.extend_from_slice(&0x0000_8000u32.to_le_bytes());
+    ix_data2.push(200u8);
+    ix_data2.push(150u8);
+    ix_data2.extend_from_slice(&5u64.to_le_bytes());
+    ix_data2.extend_from_slice(&0x1_0000_0000u64.to_le_bytes()); // UInt64 div by 2^32 (=0, rem=1000), UInt32 div by 0!
+    send_ix(&mut svm, &payer, &[], Instruction {
+        program_id,
+        accounts: vec![AccountMeta::new(out_addr, false)],
+        data: ix_data2,
+    }).expect("compiler_regression high-bit div32=0 failed");
+    let d2 = &svm.get_account(&out_addr).unwrap().data;
+    assert_eq!(u64::from_le_bytes(d2[32..40].try_into().unwrap()), 4, "Nat.sub(5, 1) must equal 4!");
+    assert_eq!(u64::from_le_bytes(d2[40..48].try_into().unwrap()), 1000, "UInt64 1000 / 2^32 ^ 1000 % 2^32 = 1000");
+    assert_eq!(u64::from_le_bytes(d2[48..56].try_into().unwrap()), 1000, "UInt32 div/mod with low32==0 must NOT trap!");
+
+    println!(
+        "[PASS] CompilerOpt  | .so = {:>6} B | CUs = {:>5} (ALU32 bit-31 + VRange + 3x memset + Nat.sub + total div/mod0 + shift32 + validator!)",
+        so.len(), meta.compute_units_consumed
+    );
+}
+
 fn bench_vs_rust() {
     println!("\n==================================================================================");
     println!("  HEAD-TO-HEAD BENCHMARK: LeanSVM (Lean 4) vs Hand-Rolled `#![no_std]` Rust (LLVM 22 -O3)");
@@ -1077,6 +1264,7 @@ fn main() {
     test_dutch_auction();
     test_bonding_curve();
     test_security_regressions();
+    test_compiler_optimizations();
     bench_vs_rust();
     println!("  ALL 8 FORMALLY VERIFIED LEAN 4 PROGRAMS + HEAD-TO-HEAD RUST BENCHMARKS PASSED!");
     println!("==================================================================================");

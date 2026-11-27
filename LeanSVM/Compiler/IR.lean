@@ -78,6 +78,25 @@ namespace BinOp
     | .or32  | .and32 | .xor32 | .lsh32 | .rsh32 => true
     | _ => false
 
+  /-- True iff `op` can trap at runtime on Solana sBPF hardware (division/modulo by zero). -/
+  def mayTrap : BinOp → Bool
+    | .div64 | .mod64 | .div32 | .mod32 => true
+    | _ => false
+
+  /-- True iff `op` is a bit shift whose immediate must be strictly `< 64` (64-bit) or `< 32` (32-bit)
+      to pass the Solana sBPF verifier. -/
+  def isShift : BinOp → Bool
+    | .lsh64 | .rsh64 | .arsh64 | .lsh32 | .rsh32 => true
+    | _ => false
+
+  /-- Mask a shift immediate into the exact verifier-legal range (`[0, 63]` for 64-bit shifts,
+      `[0, 31]` for 32-bit shifts), preserving exact Lean/sBPF shift semantics. -/
+  def maskShiftImm (op : BinOp) (imm : Int32) : Int32 :=
+    match op with
+    | .lsh64 | .rsh64 | .arsh64 => Int32.ofInt (imm.toUInt32.toNat % 64)
+    | .lsh32 | .rsh32           => Int32.ofInt (imm.toUInt32.toNat % 32)
+    | _                         => imm
+
   def isCommutative : BinOp → Bool
     | .add64 | .mul64 | .or64 | .and64 | .xor64
     | .add32 | .mul32 | .or32 | .and32 | .xor32 => true
@@ -212,6 +231,8 @@ def Stmt.defReg? : Stmt → Option VReg
   | .call d? _ _           => d?
 
 def Stmt.hasSideEffect : Stmt → Bool
+  | .binOp op _ _ _   => op.mayTrap
+  | .binImm op _ _ im => op.mayTrap && im == 0
   | .store ..         => true
   | .storeImm ..      => true
   | .storeStack ..    => true

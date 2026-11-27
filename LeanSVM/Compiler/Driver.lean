@@ -11,6 +11,7 @@ import LeanSVM.Compiler.Lower
 import LeanSVM.Compiler.Optimize
 import LeanSVM.Compiler.RegAlloc
 import LeanSVM.Compiler.CodeGen
+import LeanSVM.Compiler.Validate
 import LeanSVM.SBPF.ISA
 import LeanSVM.SBPF.ELF
 
@@ -19,14 +20,12 @@ namespace LeanSVM.Compiler
 open Lean
 
 structure CompileOptions where
-  sbpfVersion : SBPF.Version := .v0
   dumpIR      : Bool := false
   dumpAsm     : Bool := false
   deriving Repr
 
 structure CompileResult where
   entryName   : String
-  sbpfVersion : SBPF.Version
   elfBytes    : ByteArray
   insns       : Array SBPF.Insn
   insnCount   : Nat
@@ -51,25 +50,41 @@ def compileEntrypoint (env : Environment) (entryName : Name) (opts : CompileOpti
       String.intercalate "\n\n" ((prog.entry :: prog.helpers.toList).map formatFunc)
     else ""
 
-  -- Stage 2: Aggressive SSA IR Optimization (ConstFold, AddrFold, StackFold, StoreImm, CSE, TailMerge, DCE)
+  -- Stage 2: Aggressive SSA IR Optimization (ConstFold, VRange, AddrFold, StackFold, StoreImm, CSE, TailMerge, DCE)
+  --          + Interprocedural Dead Helper Elimination
   let optEntry := optimizeFunc prog.entry
   let optHelpers := prog.helpers.map optimizeFunc
-  let optProg : Program := { entry := optEntry, helpers := optHelpers, rodata := prog.rodata }
+  let optProg : Program := removeDeadHelpers { entry := optEntry, helpers := optHelpers, rodata := prog.rodata }
   let optIrDump :=
     if opts.dumpIR then
       String.intercalate "\n\n" ((optProg.entry :: optProg.helpers.toList).map formatFunc)
     else ""
 
-  -- Stage 3: Coalescing Linear-Scan Register Allocation + Direct sBPF CodeGen + Peephole Optimization
-  let (insns, alloc, helperCount) := generateProgramCode optProg
+  -- Stage 3: Formally Verified Translation Validation (CFG, Immediates, Liveness & RegAlloc)
+  --          + Direct sBPF CodeGen + Peephole Optimization
+  validateProgramCFG optProg
+  let entryAlloc := allocateRegisters optProg.entry
+  validateFuncAlloc optProg.entry entryAlloc
+  let mut allInsns := generateFuncCodeWithAlloc optProg.entry entryAlloc
+  let mut maxStack := entryAlloc.totalStackBytes
+  let mut totalSpills := entryAlloc.spillCount
+  for h in optProg.helpers do
+    let hAlloc := allocateRegisters h
+    validateFuncAlloc h hAlloc
+    allInsns := allInsns ++ generateFuncCodeWithAlloc h hAlloc
+    maxStack := max maxStack hAlloc.totalStackBytes
+    totalSpills := totalSpills + hAlloc.spillCount
+  let insns := SBPF.peepholeOptimize allInsns
+  validateSbpfProgram entryName.toString insns
+  let alloc : AllocResult := { entryAlloc with totalStackBytes := maxStack, spillCount := totalSpills }
+  let helperCount := optProg.helpers.size
   let asmDump := if opts.dumpAsm then SBPF.formatProgram insns else ""
 
-  -- Stage 4: Direct Native ELF64 `.so` Linking & Serialization
-  let (elfBytes, assembled) ← SBPF.emitElf insns prog.rodata opts.sbpfVersion
+  -- Stage 4: Direct Native sBPF v3 ELF64 `.so` Linking & Serialization (SIMD-0178 + SIMD-0189 + SIMD-0377)
+  let (elfBytes, assembled) ← SBPF.emitElf insns prog.rodata
 
   return {
     entryName   := entryName.toString
-    sbpfVersion := opts.sbpfVersion
     elfBytes    := elfBytes
     insns       := insns
     insnCount   := assembled.insnCount
@@ -86,8 +101,7 @@ def compileEntrypoint (env : Environment) (entryName : Name) (opts : CompileOpti
   }
 
 def CompileResult.formatStats (r : CompileResult) : String :=
-  let verStr := match r.sbpfVersion with | .v0 => "sBPF v0" | .v3 => "sBPF v3"
-  s!"[lean-svm] Compiled {r.entryName} ({verStr})\n" ++
+  s!"[lean-svm] Compiled {r.entryName} (sBPF v3)\n" ++
   s!"  instructions : {r.insnCount} (helpers: {r.helperCount})\n" ++
   s!"  .text size   : {r.textBytes} bytes\n" ++
   s!"  .rodata size : {r.rodataBytes} bytes\n" ++

@@ -7,6 +7,10 @@
 | **Severity** | Soundness: the compiled program computed a different value from the Lean program, with no warning |
 | **Effect on upstream examples** | None: all 8 example `.so` files are byte-identical |
 
+> **Update (upstream `587ab09`, sBPF v3).** Still present upstream (`valToReg` keeps only the tag).
+> The regression test still fails without this patch. The live diff is
+> [`current-vs-upstream.diff`](current-vs-upstream.diff).
+
 ## The bug
 
 `valToReg` turns a lowered value into a single 64-bit register. For a constructor with a tag other

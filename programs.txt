@@ -8,6 +8,7 @@ Examples.Amm                 Examples.Amm.entrypoint                  amm
 Examples.Lending             Examples.Lending.entrypoint              lending
 Examples.DutchAuction        Examples.DutchAuction.entrypoint         dutch_auction
 Examples.BondingCurve        Examples.BondingCurve.entrypoint         bonding_curve
+Examples.CompilerRegression  Examples.CompilerRegression.entrypoint   compiler_regression
 # ── LEMMA programs ──
 Lemma.Examples.GuardedCounter Lemma.Examples.GuardedCounter.entrypoint  guarded_counter
 # ── LEMMA test probes for the real SVM (svm-runner/src/bin/lemma.rs) ──

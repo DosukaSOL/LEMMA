@@ -1,4 +1,5 @@
 import LeanSVM.Types
+import LeanSVM.Sha256
 import LeanSVM.Runtime
 import LeanSVM.Input
 import LeanSVM.Math
@@ -11,5 +12,6 @@ import LeanSVM.Compiler.Lower
 import LeanSVM.Compiler.Optimize
 import LeanSVM.Compiler.RegAlloc
 import LeanSVM.Compiler.CodeGen
+import LeanSVM.Compiler.Validate
 import LeanSVM.Compiler.Proofs
 import LeanSVM.Compiler.Driver

@@ -1,5 +1,8 @@
 /-
-  LemmaTest.Sbpf — an independent, executable sBPF v0 interpreter used as a TEST ORACLE.
+  LemmaTest.Sbpf — an independent, executable sBPF interpreter (v3, as targeted by lean-svm)
+  used as a TEST ORACLE. ALU, call-frame and exit semantics follow Agave's `solana-sbpf`
+  v0.23.0 interpreter (the version LiteSVM 0.18.2 uses): fixed 4 KiB frames without gaps,
+  automatic `r10` bump on call, `r6..r9` restored on exit, max call depth 64.
 
   Why this exists: the LiteSVM runner needs crates.io, which may be unavailable. This interpreter
   executes the *symbolic* instruction stream produced by the real lean-svm compiler pipeline
@@ -96,7 +99,10 @@ def alu64 (op : AluOp) (a b : UInt64) : Option UInt64 :=
   | .arsh => some (a.toInt64 >>> (b &&& 63).toInt64).toUInt64
   | .mov => some b
 
-/-- 32-bit ALU; result zero-extended (sBPF v0). -/
+/-- 32-bit ALU, following Agave's `solana-sbpf` v0.23.0 interpreter for sBPF v0 and v3
+    (`src/interpreter.rs`): `add32`/`sub32`/`mul32` results are SIGN-extended to 64 bits
+    (`sign_extension`: `value as i64 as u64`, since `explicit_sign_extension_of_results` is
+    V2-only); every other 32-bit op, including `mov32`, is zero-extended (`as u32 as u64`). -/
 def alu32 (op : AluOp) (a b : UInt64) : Option UInt64 :=
   let x := a.toUInt32; let y := b.toUInt32
   let r : Option UInt32 := match op with
@@ -107,7 +113,8 @@ def alu32 (op : AluOp) (a b : UInt64) : Option UInt64 :=
     | .lsh => some (x <<< (y &&& 31)) | .rsh => some (x >>> (y &&& 31))
     | .arsh => some (x.toInt32 >>> (y &&& 31).toInt32).toUInt32
     | .mov => some y
-  r.map (·.toUInt64)
+  let signExtends := match op with | .add | .sub | .mul => true | _ => false
+  r.map fun v => if signExtends then v.toInt32.toInt64.toUInt64 else v.toUInt64
 
 def jcc (c : JmpCond) (a b : UInt64) : Bool :=
   match c with
